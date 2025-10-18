@@ -30,6 +30,19 @@ typedef struct {
   u32 selected_seed_index;    /* the recently selected seed index */
   void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
   u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
+
+  // Bandits:
+  double *bandit_w;           /* weights per seed (length = seeds_count) */
+  double  gamma;              /* exploration parameter (mixing or implicit) */
+  double  eta;                /* learning rate */
+  u32     bandit_rounds       /* number of updates performed */
+
+  /* Seed hierarchy and selection tracking */
+  u32 selected_count;              /* How many times this seed was selected */
+  u32 parent_index_primary;        /* Primary parent seed index, or 0xFFFFFFFF if none */
+  u32 parent_index_secondary;      /* Secondary parent (for splice), or 0xFFFFFFFF if none */
+  u32 child_count;                 /* Number of children created from this seed */
+  u32* children_indices;           /* Dynamic array [child_count] of child indices */
 } state_info_t;
 
 enum {
