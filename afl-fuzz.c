@@ -419,68 +419,119 @@ static double get_env_double(const char* name, double defv) {
 }
 
 /* Bandit logging */
-static int bandit_debug = 1;
-static FILE* bandit_log_fp = NULL;
-static inline int bandit_debug_enabled(void) {
-  if (bandit_debug == -1) {
-    const char* s = getenv("AFLNET_BANDIT_DEBUG");
-    bandit_debug = (s && atoi(s) == 1) ? 1 : 0;
-    if (bandit_debug) {
-      char* fn = alloc_printf("%s/bandit_log.txt", out_dir ? out_dir : ".");
-      int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-      if (fd >= 0) bandit_log_fp = fdopen(fd, "w");
-      ck_free(fn);
-    }
+static int bandit_log_fd = 1;
+
+static void bandit_log_open(void) {
+  if (bandit_log_fd >= 0) return;
+  const char* path_env = getenv("AFLNET_BANDIT_LOG");
+  char path[512];
+  if (path_env && path_env[0]) {
+    snprintf(path, sizeof(path), "%s.%d", path_env, getpid());
+  } else {
+    snprintf(path, sizeof(path), "/tmp/aflnet_bandit_%d.log", getpid());
   }
-  return bandit_debug && bandit_log_fp != NULL;
+  bandit_log_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 }
-#define BANDIT_LOG(fmt, ...) do { \
-  if (bandit_debug_enabled()) { \
-    fprintf(bandit_log_fp, "[BANDIT] " fmt "\n", ##__VA_ARGS__); \
-    fflush(bandit_log_fp); \
-  } \
-} while (0)
+
+static void bandit_logf(const char* fmt, ...) {
+  if (bandit_log_fd < 0) bandit_log_open();
+  if (bandit_log_fd < 0) return;
+  char buf[2048];
+  struct timeval tv; gettimeofday(&tv, NULL);
+  int off = snprintf(buf, sizeof(buf), "[%ld.%06ld][pid=%d] ",
+                     (long)tv.tv_sec, (long)tv.tv_usec, getpid());
+  if (off < 0) off = 0;
+  va_list ap; va_start(ap, fmt);
+  int n = vsnprintf(buf + off, sizeof(buf) - off, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  size_t total = off + (size_t)n;
+  if (total >= sizeof(buf)) total = sizeof(buf) - 1;
+  buf[total++] = '\n';
+  (void)!write(bandit_log_fd, buf, total);
+}
+
+/* Helper: dump weights and probabilities for first N arms (capped) */
+static void bandit_dump_weights(state_info_t* st, const char* tag) {
+  if (!st || !st->bandit_w) { bandit_logf("bandit:%s no state or no weights", tag); return; }
+  u32 K = st->seeds_count;
+  double sumw = 0.0; for (u32 i=0; i<K; ++i) sumw += st->bandit_w[i];
+  u32 N = (K > 64) ? 64 : K;
+  bandit_logf("bandit:%s state=%u K=%u sumw=%.6e (showing first %u)", tag, st->id, K, sumw, N);
+  for (u32 i=0; i<N; ++i) {
+    double w = st->bandit_w[i];
+    double pi = (sumw > 0.0) ? (w/sumw) : 0.0;
+    bandit_logf("bandit:%s i=%u w=%.6e pi=%.6f", tag, i, w, pi);
+  }
+}
+
+/* Helper: validate gamma/eta and weights to catch NaNs/Infs */
+static void bandit_check_params(state_info_t* st, const char* where) {
+  if (!st) { bandit_logf("bandit:%s st=NULL", where); return; }
+  double g = st->gamma, e = st->eta;
+  if (!(g >= 0.0 && g <= 1.0)) bandit_logf("bandit:%s WARN gamma out of range: %.6f", where, g);
+  if (!(e > 0.0 && e < 10.0)) bandit_logf("bandit:%s WARN eta unusual: %.6f", where, e);
+  if (!st->bandit_w) { bandit_logf("bandit:%s weights=NULL", where); return; }
+  u32 K = st->seeds_count;
+  double sumw = 0.0; int bad = 0;
+  for (u32 i=0; i<K; ++i) {
+    double w = st->bandit_w[i];
+    if (!(w > 0.0) || isnan(w) || isinf(w)) { bad = 1; bandit_logf("bandit:%s bad weight[%u]=%.6e", where, i, w); }
+    sumw += w;
+  }
+  if (sumw <= 0.0 || isnan(sumw) || isinf(sumw)) bandit_logf("bandit:%s bad sumw=%.6e", where, sumw);
+}
 
 static void ensure_bandit_arrays(state_info_t* st) {
-  if (!st) return;
+  if (!st) { bandit_logf("ensure: st=NULL"); return; }
   if (!st->bandit_w && st->seeds_count) {
     st->bandit_w = (double*)ck_alloc(st->seeds_count * sizeof(double));
     for (u32 i = 0; i < st->seeds_count; ++i) st->bandit_w[i] = 1.0;
-    /* Get gamma and eta from environment if set */
     if (st->gamma == 0.0) st->gamma = get_env_double("AFLNET_EXP3_GAMMA", 0.1);
     if (st->eta   == 0.0) st->eta   = get_env_double("AFLNET_EXP3_ETA",   0.1);
-    if (st->gamma == 0.0) st->gamma = 0.1; /* defaults if unset */
+    if (st->gamma == 0.0) st->gamma = 0.1;
     if (st->eta   == 0.0) st->eta   = 0.1;
-    BANDIT_LOG("ensure_bandit_arrays: init state=%u K=%u gamma=%.6f eta=%.6f",
-               st->id, st->seeds_count, st->gamma, st->eta);
+    if (st->gamma < 0.0) { bandit_logf("ensure: clamping gamma %.6f -> 0.0", st->gamma); st->gamma = 0.0; }
+    if (st->gamma > 0.99) { bandit_logf("ensure: clamping gamma %.6f -> 0.99", st->gamma); st->gamma = 0.99; }
+    if (st->eta <= 0.0) { bandit_logf("ensure: clamping eta %.6f -> 0.1", st->eta); st->eta = 0.1; }
+    if (st->eta > 5.0) { bandit_logf("ensure: clamping eta %.6f -> 5.0", st->eta); st->eta = 5.0; }
+    bandit_logf("ensure: init state=%u K=%u gamma=%.6f eta=%.6f", st->id, st->seeds_count, st->gamma, st->eta);
+    bandit_check_params(st, "ensure:init");
   } else if (st->bandit_w && st->seeds_count) {
-    double old_sum = 0.0;
-    for (u32 i = 0; i < st->seeds_count; ++i) old_sum += st->bandit_w[i];
+    double sumw_old = 0.0;
+    for (u32 i=0;i<st->seeds_count;++i) sumw_old += st->bandit_w[i];
     st->bandit_w = (double*)ck_realloc(st->bandit_w, st->seeds_count * sizeof(double));
-    for (u32 i = 0; i < st->seeds_count; ++i) {
-      if (st->bandit_w[i] <= 0.0) st->bandit_w[i] = 1.0;
+    for (u32 i=0; i<st->seeds_count; ++i) {
+      if (!(st->bandit_w[i] > 0.0) || isnan(st->bandit_w[i]) || isinf(st->bandit_w[i])) {
+        bandit_logf("ensure: reset bad weight[%u]=%.6e to 1.0", i, st->bandit_w[i]);
+        st->bandit_w[i] = 1.0;
+      }
     }
-    double new_sum = 0.0;
-    for (u32 i = 0; i < st->seeds_count; ++i) new_sum += st->bandit_w[i];
-    BANDIT_LOG("ensure_bandit_arrays: extend state=%u K=%u sum_w(old)=%.6e sum_w(new)=%.6e",
-               st->id, st->seeds_count, old_sum, new_sum);
+    double sumw_new = 0.0;
+    for (u32 i=0;i<st->seeds_count;++i) sumw_new += st->bandit_w[i];
+    bandit_logf("ensure: extend state=%u K=%u sumw_old=%.6e sumw_new=%.6e", st->id, st->seeds_count, sumw_old, sumw_new);
+    bandit_check_params(st, "ensure:extend");
+  } else {
+    bandit_logf("ensure: state=%u K=%u no weights", st->id, st->seeds_count);
   }
 }
-
 
 /* Sample an index according to probabilities p_i computed from weights and algorithm */
 static u32 bandit_sample_index(state_info_t* st, u8 algo, double* out_pi) {
   ensure_bandit_arrays(st);
+  if (!st) { bandit_logf("sample: st=NULL"); return 0; }
   u32 K = st->seeds_count;
-  if (K == 0) { BANDIT_LOG("bandit_sample_index: state=%u K=0", st ? st->id : 0); return 0; }
+  if (K == 0) { bandit_logf("sample: state=%u K=0", st->id); return 0; }
 
   double sumw = 0.0;
-  for (u32 i = 0; i < K; ++i) sumw += st->bandit_w[i];
-  if (sumw <= 0.0) {
-    for (u32 i = 0; i < K; ++i) st->bandit_w[i] = 1.0;
+  for (u32 i=0; i<K; ++i) sumw += st->bandit_w[i];
+  if (!(sumw > 0.0) || isnan(sumw) || isinf(sumw)) {
+    for (u32 i=0;i<K;++i) st->bandit_w[i] = 1.0;
     sumw = (double)K;
-    BANDIT_LOG("bandit_sample_index: state=%u reset weights to 1.0 (sumw<=0)", st->id);
+    bandit_logf("sample: state=%u reset weights due to bad sumw", st->id);
   }
+
+  bandit_dump_weights(st, "pre-sample");
 
   double u = rand01();
   double cdf = 0.0;
@@ -488,98 +539,111 @@ static u32 bandit_sample_index(state_info_t* st, u8 algo, double* out_pi) {
 
   if (algo == EXP3) {
     double mix = st->gamma;
-    double avg_pi = 0.0;
-    for (u32 i = 0; i < K; ++i) {
-      double pi = (1.0 - mix) * (st->bandit_w[i] / sumw) + mix * (1.0 / (double)K);
-      avg_pi += pi;
+    for (u32 i=0; i<K; ++i) {
+      double base = st->bandit_w[i] / sumw;
+      double pi = (1.0 - mix) * base + mix * (1.0 / (double)K);
+      if (isnan(pi) || isinf(pi) || pi < 0.0) bandit_logf("sample: EXP3 bad pi[%u]=%.6e base=%.6e", i, pi, base);
       cdf += pi;
       if (u <= cdf) {
         idx = i; if (out_pi) *out_pi = pi;
-        BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3 K=%u sumw=%.6e u=%.6f idx=%u pi=%.6f mix=%.6f avg_pi=%.6f",
-                   st->id, K, sumw, u, idx, pi, mix, avg_pi / (double)(i + 1));
+        bandit_logf("sample: EXP3 state=%u K=%u sumw=%.6e mix=%.6f u=%.6f idx=%u pi=%.6f cdf=%.6f",
+                    st->id, K, sumw, mix, u, idx, pi, cdf);
         return idx;
       }
     }
-    idx = K - 1; double pi_last = (1.0 - mix) * (st->bandit_w[idx] / sumw) + mix * (1.0 / (double)K);
+    idx = K-1;
+    double pi_last = (1.0 - mix) * (st->bandit_w[idx]/sumw) + mix * (1.0/(double)K);
     if (out_pi) *out_pi = pi_last;
-    BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3 tail idx=%u pi=%.6f", st->id, idx, pi_last);
+    bandit_logf("sample: EXP3 tail idx=%u pi=%.6f u=%.6f cdf=%.6f", idx, pi_last, u, cdf);
     return idx;
   } else {
-    double avg_pi = 0.0;
-    for (u32 i = 0; i < K; ++i) {
+    for (u32 i=0; i<K; ++i) {
       double pi = st->bandit_w[i] / sumw;
-      avg_pi += pi;
+      if (isnan(pi) || isinf(pi) || pi < 0.0) bandit_logf("sample: EXP3_IX bad pi[%u]=%.6e", i, pi);
       cdf += pi;
       if (u <= cdf) {
         idx = i; if (out_pi) *out_pi = pi;
-        BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3_IX K=%u sumw=%.6e u=%.6f idx=%u pi=%.6f avg_pi=%.6f",
-                   st->id, K, sumw, u, idx, pi, avg_pi / (double)(i + 1));
+        bandit_logf("sample: EXP3_IX state=%u K=%u sumw=%.6e u=%.6f idx=%u pi=%.6f cdf=%.6f",
+                    st->id, K, sumw, u, idx, pi, cdf);
         return idx;
       }
     }
-    idx = K - 1; double pi_last = st->bandit_w[idx] / sumw;
+    idx = K-1; double pi_last = st->bandit_w[idx] / sumw;
     if (out_pi) *out_pi = pi_last;
-    BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3_IX tail idx=%u pi=%.6f", st->id, idx, pi_last);
+    bandit_logf("sample: EXP3_IX tail idx=%u pi=%.6f u=%.6f cdf=%.6f", idx, pi_last, u, cdf);
     return idx;
   }
 }
 
 /* Update the bandit after observing reward in [0,1] */
 static void bandit_update_for_state(u32 state_id, u8 algo, double reward) {
-  if (!bandit_last_was_used) { BANDIT_LOG("bandit_update_for_state: skip (last not bandit-chosen)"); return; }
+  if (!bandit_last_was_used) { bandit_logf("update: skip (last not bandit-chosen)"); return; }
   if (state_id != bandit_last_state_id || !bandit_last_seed) {
-    BANDIT_LOG("bandit_update_for_state: mismatch state_id=%u last_state=%u or null seed", state_id, bandit_last_state_id);
-    bandit_last_was_used = 0;
-    return;
+    bandit_logf("update: mismatch state=%u last=%u or seed=NULL", state_id, bandit_last_state_id);
+    bandit_last_was_used = 0; return;
   }
 
   khint_t k = kh_get(hms, khms_states, state_id);
-  if (k == kh_end(khms_states)) { BANDIT_LOG("bandit_update_for_state: state %u not found", state_id); bandit_last_was_used = 0; return; }
+  if (k == kh_end(khms_states)) { bandit_logf("update: state %u not found", state_id); bandit_last_was_used = 0; return; }
 
   state_info_t* st = kh_val(khms_states, k);
   if (!st || bandit_last_seed_idx >= st->seeds_count) {
-    BANDIT_LOG("bandit_update_for_state: bad st or idx out of range (idx=%u K=%u)", bandit_last_seed_idx, st ? st->seeds_count : 0);
-    bandit_last_was_used = 0;
-    return;
+    bandit_logf("update: bad st or idx=%u out of range K=%u", bandit_last_seed_idx, st ? st->seeds_count : 0);
+    bandit_last_was_used = 0; return;
   }
 
   ensure_bandit_arrays(st);
-  u32 K = st->seeds_count;
-  double sumw = 0.0;
-  for (u32 i = 0; i < K; ++i) sumw += st->bandit_w[i];
+  bandit_check_params(st, "update:pre");
+  bandit_dump_weights(st, "pre-update");
 
-  double pi = 0.0, denom = 0.0, rhat = 0.0, old_w = st->bandit_w[bandit_last_seed_idx];
+  u32 K = st->seeds_count;
+  double sumw = 0.0; for (u32 i=0; i<K; ++i) sumw += st->bandit_w[i];
+  if (!(sumw > 0.0)) { bandit_logf("update: bad sumw=%.6e", sumw); sumw = (double)K; }
+
+  double old_w = st->bandit_w[bandit_last_seed_idx];
+  if (!(old_w > 0.0) || isnan(old_w) || isinf(old_w)) { bandit_logf("update: old_w bad=%.6e reset->1.0", old_w); old_w = 1.0; st->bandit_w[bandit_last_seed_idx] = 1.0; }
+
+  double pi_comp = 0.0, denom = 0.0, rhat = 0.0;
 
   if (algo == EXP3) {
-    pi = (1.0 - st->gamma) * (old_w / sumw) + st->gamma * (1.0 / (double)K);
-    denom = (pi > 1e-12) ? pi : 1e-12;
-    rhat = reward / denom;
-    st->bandit_w[bandit_last_seed_idx] *= exp(st->eta * rhat);
-    BANDIT_LOG("update: state=%u algo=EXP3 idx=%u reward=%.6f pi=%.6f denom=%.6e rhat=%.6f eta=%.6f w_old=%.6e w_new=%.6e",
-               state_id, bandit_last_seed_idx, reward, pi, denom, rhat, st->eta,
-               old_w, st->bandit_w[bandit_last_seed_idx]);
+    pi_comp = (1.0 - st->gamma) * (old_w / sumw) + st->gamma * (1.0 / (double)K);
+    denom = (pi_comp > 1e-12) ? pi_comp : 1e-12;
   } else {
     double pi_pure = old_w / sumw;
-    denom = pi_pure + st->gamma; if (denom < 1e-12) denom = 1e-12;
-    rhat = reward / denom;
-    st->bandit_w[bandit_last_seed_idx] *= exp(st->eta * rhat);
-    BANDIT_LOG("update: state=%u algo=EXP3_IX idx=%u reward=%.6f pi_pure=%.6f denom=%.6e rhat=%.6f eta=%.6f w_old=%.6e w_new=%.6e",
-               state_id, bandit_last_seed_idx, reward, pi_pure, denom, rhat, st->eta,
-               old_w, st->bandit_w[bandit_last_seed_idx]);
+    pi_comp = pi_pure;
+    denom = pi_pure + st->gamma;
+    if (denom < 1e-12) denom = 1e-12;
   }
 
-  /* Normalize if needed */
-  double maxw = 0.0;
-  for (u32 i = 0; i < K; ++i) if (st->bandit_w[i] > maxw) maxw = st->bandit_w[i];
-  if (maxw > 1e50) {
-    for (u32 i = 0; i < K; ++i) st->bandit_w[i] /= maxw;
-    BANDIT_LOG("update: state=%u weights renormalized by maxw=%.6e", state_id, maxw);
+  rhat = reward / denom;
+
+  /* Guard against overflow: if eta*rhat huge, cap exp argument */
+  double arg = st->eta * rhat;
+  if (arg > 100.0) { bandit_logf("update: capping exp arg %.6f -> 100.0", arg); arg = 100.0; }
+  if (arg < -100.0) { bandit_logf("update: capping exp arg %.6f -> -100.0", arg); arg = -100.0; }
+
+  double new_w = old_w * exp(arg);
+  if (!isfinite(new_w) || new_w <= 0.0) {
+    bandit_logf("update: new_w invalid %.6e, resetting to 1.0", new_w);
+    new_w = 1.0;
+  }
+  st->bandit_w[bandit_last_seed_idx] = new_w;
+
+  bandit_logf("update: state=%u algo=%s idx=%u reward=%.6f pi=%.6f denom=%.6e rhat=%.6f eta=%.6f w_old=%.6e w_new=%.6e",
+              state_id, (algo==EXP3?"EXP3":"EXP3_IX"), bandit_last_seed_idx, reward, pi_comp, denom, rhat, st->eta, old_w, new_w);
+
+  /* Renormalize if weights explode */
+  double maxw = 0.0; for (u32 i=0; i<K; ++i) if (st->bandit_w[i] > maxw) maxw = st->bandit_w[i];
+  if (maxw > 1e50 || isnan(maxw) || isinf(maxw)) {
+    for (u32 i=0; i<K; ++i) st->bandit_w[i] = (isfinite(st->bandit_w[i]) && st->bandit_w[i] > 0.0) ? (st->bandit_w[i] / maxw) : 1.0;
+    bandit_logf("update: renormalized by maxw=%.6e", maxw);
   }
 
   st->bandit_rounds++;
-  BANDIT_LOG("update: state=%u rounds=%llu", state_id, (unsigned long long)st->bandit_rounds);
+  bandit_dump_weights(st, "post-update");
+  bandit_check_params(st, "update:post");
 
-  bandit_last_was_used = 0; /* consume the last choice */
+  bandit_last_was_used = 0;
 }
 
 /* Helper for seed selection stat tracking */
@@ -944,27 +1008,37 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         break;
       case EXP3:
       case EXP3_IX: {
-        /* Per-state bandit over seeds that reach this state */
-        double pi = 0.0;
         ensure_bandit_arrays(state);
-        if (state->seeds_count == 0) return NULL;
+        bandit_logf("choose_seed: state=%u algo=%s seeds_count=%u", target_state_id, (mode==EXP3?"EXP3":"EXP3_IX"), state->seeds_count);
+        if (state->seeds_count == 0) { bandit_logf("choose_seed: no seeds for state=%u", target_state_id); return NULL; }
 
+        /* Validate seeds[] pointers */
+        for (u32 i=0; i<state->seeds_count; ++i) {
+          if (!state->seeds[i]) bandit_logf("choose_seed: WARN seeds[%u]=NULL", i);
+        }
+
+        bandit_dump_weights(state, "pre-sample");
+        double pi = 0.0;
         u32 idx = bandit_sample_index(state, mode, &pi);
+
+        if (idx >= state->seeds_count) {
+          bandit_logf("choose_seed: idx=%u out of range K=%u", idx, state->seeds_count);
+          idx = state->seeds_count - 1;
+        }
         result = (struct queue_entry*)state->seeds[idx];
+        if (!result) {
+          bandit_logf("choose_seed: selected seed NULL at idx=%u", idx);
+          return NULL;
+        }
 
-        ((struct queue_entry*)result)->selected_count++;
-
-        /* Bookkeeping for update after fuzzing */
+        result->selected_count++;
         bandit_last_seed = result;
         bandit_last_state_id = target_state_id;
         bandit_last_seed_idx = idx;
         bandit_last_was_used = 1;
 
-        BANDIT_LOG("choose_seed: state=%u algo=%s K=%u idx=%u pi=%.6f seed_index_global=%u fname=%s",
-                  target_state_id, (mode==EXP3?"EXP3":"EXP3_IX"),
-                  state->seeds_count, idx, pi,
-                  result->index, result->fname ? result->fname : "(null)");
-
+        bandit_logf("choose_seed: picked idx=%u pi=%.6f global_index=%u fname=%s",
+                    idx, pi, result->index, result->fname ? result->fname : "(null)");
         break;
       }
       default:
@@ -9153,6 +9227,10 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
+  bandit_log_open();
+  bandit_logf("bandit: logger started");
+
+
   while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:")) > 0)
 
     switch (opt) {
@@ -9707,18 +9785,22 @@ int main(int argc, char** argv) {
 
       /* MAB: compute reward in [0,1] */
       double reward = 0.0;
-      if (queued_discovered > pre_discovered || unique_crashes > pre_uc || unique_hangs > pre_uh) {
-        reward = 1.0;
-      } else if (queued_with_cov > pre_cov) {
-        reward = 0.5;
+      if (queued_discovered > pre_discovered || unique_crashes > pre_uc || unique_hangs > pre_uh) reward = 1.0;
+      else if (queued_with_cov > pre_cov) reward = 0.5;
+      bandit_logf("reward: state=%u delta_discovered=%lld delta_cov=%lld delta_uc=%lld delta_uh=%lld reward=%.3f",
+                  target_state_id,
+                  (long long)(queued_discovered - pre_discovered),
+                  (long long)(queued_with_cov - pre_cov),
+                  (long long)(unique_crashes - pre_uc),
+                  (long long)(unique_hangs - pre_uh),
+                  reward);
+
+      if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_last_was_used) {
+        bandit_logf("update_call: state=%u algo=%u", target_state_id, seed_selection_algo);
+        bandit_update_for_state(target_state_id, seed_selection_algo, reward);
+      } else {
+        bandit_logf("update_call: skipped (algo=%u used=%u)", seed_selection_algo, bandit_last_was_used);
       }
-      BANDIT_LOG("reward: state=%u discovered_delta=%llu cov_delta=%llu uc_delta=%llu uh_delta=%llu reward=%.3f",
-           target_state_id,
-           (unsigned long long)(queued_discovered - pre_discovered),
-           (unsigned long long)(queued_with_cov - pre_cov),
-           (unsigned long long)(unique_crashes - pre_uc),
-           (unsigned long long)(unique_hangs - pre_uh),
-           reward);
 
       /* MAB: update bandit if we used it for the last choice */
       if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_last_was_used) {
