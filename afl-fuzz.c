@@ -418,6 +418,29 @@ static double get_env_double(const char* name, double defv) {
   return defv;
 }
 
+/* Bandit logging */
+static int bandit_debug = 1;
+static FILE* bandit_log_fp = NULL;
+static inline int bandit_debug_enabled(void) {
+  if (bandit_debug == -1) {
+    const char* s = getenv("AFLNET_BANDIT_DEBUG");
+    bandit_debug = (s && atoi(s) == 1) ? 1 : 0;
+    if (bandit_debug) {
+      char* fn = alloc_printf("%s/bandit_log.txt", out_dir ? out_dir : ".");
+      int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (fd >= 0) bandit_log_fp = fdopen(fd, "w");
+      ck_free(fn);
+    }
+  }
+  return bandit_debug && bandit_log_fp != NULL;
+}
+#define BANDIT_LOG(fmt, ...) do { \
+  if (bandit_debug_enabled()) { \
+    fprintf(bandit_log_fp, "[BANDIT] " fmt "\n", ##__VA_ARGS__); \
+    fflush(bandit_log_fp); \
+  } \
+} while (0)
+
 static void ensure_bandit_arrays(state_info_t* st) {
   if (!st) return;
   if (!st->bandit_w && st->seeds_count) {
@@ -428,96 +451,134 @@ static void ensure_bandit_arrays(state_info_t* st) {
     if (st->eta   == 0.0) st->eta   = get_env_double("AFLNET_EXP3_ETA",   0.1);
     if (st->gamma == 0.0) st->gamma = 0.1; /* defaults if unset */
     if (st->eta   == 0.0) st->eta   = 0.1;
+    BANDIT_LOG("ensure_bandit_arrays: init state=%u K=%u gamma=%.6f eta=%.6f",
+               st->id, st->seeds_count, st->gamma, st->eta);
   } else if (st->bandit_w && st->seeds_count) {
-    /* if seeds were appended since last time, extend weights with 1.0 */
-    /* find current length by checking for extra NULL? we know the count; reallocate */
+    double old_sum = 0.0;
+    for (u32 i = 0; i < st->seeds_count; ++i) old_sum += st->bandit_w[i];
     st->bandit_w = (double*)ck_realloc(st->bandit_w, st->seeds_count * sizeof(double));
-    /* initialize only new slots; caller cannot know previous size, so ensure caller sets weight for new arms */
-    /* Safe init: set any zero weight to 1.0 (we never set zeros otherwise) */
     for (u32 i = 0; i < st->seeds_count; ++i) {
       if (st->bandit_w[i] <= 0.0) st->bandit_w[i] = 1.0;
     }
+    double new_sum = 0.0;
+    for (u32 i = 0; i < st->seeds_count; ++i) new_sum += st->bandit_w[i];
+    BANDIT_LOG("ensure_bandit_arrays: extend state=%u K=%u sum_w(old)=%.6e sum_w(new)=%.6e",
+               st->id, st->seeds_count, old_sum, new_sum);
   }
 }
+
 
 /* Sample an index according to probabilities p_i computed from weights and algorithm */
 static u32 bandit_sample_index(state_info_t* st, u8 algo, double* out_pi) {
   ensure_bandit_arrays(st);
   u32 K = st->seeds_count;
-  if (K == 0) return 0;
-  /* compute probabilities */
+  if (K == 0) { BANDIT_LOG("bandit_sample_index: state=%u K=0", st ? st->id : 0); return 0; }
+
   double sumw = 0.0;
   for (u32 i = 0; i < K; ++i) sumw += st->bandit_w[i];
-  if (sumw <= 0.0) { /* reset */
+  if (sumw <= 0.0) {
     for (u32 i = 0; i < K; ++i) st->bandit_w[i] = 1.0;
     sumw = (double)K;
+    BANDIT_LOG("bandit_sample_index: state=%u reset weights to 1.0 (sumw<=0)", st->id);
   }
-  /* we will sample via cumulative distribution */
+
   double u = rand01();
   double cdf = 0.0;
   u32 idx = 0;
+
   if (algo == EXP3) {
     double mix = st->gamma;
+    double avg_pi = 0.0;
     for (u32 i = 0; i < K; ++i) {
       double pi = (1.0 - mix) * (st->bandit_w[i] / sumw) + mix * (1.0 / (double)K);
+      avg_pi += pi;
       cdf += pi;
-      if (u <= cdf) { idx = i; if (out_pi) *out_pi = pi; return idx; }
+      if (u <= cdf) {
+        idx = i; if (out_pi) *out_pi = pi;
+        BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3 K=%u sumw=%.6e u=%.6f idx=%u pi=%.6f mix=%.6f avg_pi=%.6f",
+                   st->id, K, sumw, u, idx, pi, mix, avg_pi / (double)(i + 1));
+        return idx;
+      }
     }
-    /* numeric tail */
-    idx = K - 1; if (out_pi) *out_pi = (1.0 - mix) * (st->bandit_w[idx] / sumw) + mix * (1.0 / (double)K);
+    idx = K - 1; double pi_last = (1.0 - mix) * (st->bandit_w[idx] / sumw) + mix * (1.0 / (double)K);
+    if (out_pi) *out_pi = pi_last;
+    BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3 tail idx=%u pi=%.6f", st->id, idx, pi_last);
     return idx;
-  } else { /* EXP3_IX or default: pure softmax over weights */
+  } else {
+    double avg_pi = 0.0;
     for (u32 i = 0; i < K; ++i) {
       double pi = st->bandit_w[i] / sumw;
+      avg_pi += pi;
       cdf += pi;
-      if (u <= cdf) { idx = i; if (out_pi) *out_pi = pi; return idx; }
+      if (u <= cdf) {
+        idx = i; if (out_pi) *out_pi = pi;
+        BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3_IX K=%u sumw=%.6e u=%.6f idx=%u pi=%.6f avg_pi=%.6f",
+                   st->id, K, sumw, u, idx, pi, avg_pi / (double)(i + 1));
+        return idx;
+      }
     }
-    idx = K - 1; if (out_pi) *out_pi = st->bandit_w[idx] / sumw;
+    idx = K - 1; double pi_last = st->bandit_w[idx] / sumw;
+    if (out_pi) *out_pi = pi_last;
+    BANDIT_LOG("bandit_sample_index: state=%u algo=EXP3_IX tail idx=%u pi=%.6f", st->id, idx, pi_last);
     return idx;
   }
 }
 
 /* Update the bandit after observing reward in [0,1] */
 static void bandit_update_for_state(u32 state_id, u8 algo, double reward) {
-  if (!bandit_last_was_used) return;
-  if (state_id != bandit_last_state_id || !bandit_last_seed) return;
+  if (!bandit_last_was_used) { BANDIT_LOG("bandit_update_for_state: skip (last not bandit-chosen)"); return; }
+  if (state_id != bandit_last_state_id || !bandit_last_seed) {
+    BANDIT_LOG("bandit_update_for_state: mismatch state_id=%u last_state=%u or null seed", state_id, bandit_last_state_id);
+    bandit_last_was_used = 0;
+    return;
+  }
 
   khint_t k = kh_get(hms, khms_states, state_id);
-  if (k == kh_end(khms_states)) return;
+  if (k == kh_end(khms_states)) { BANDIT_LOG("bandit_update_for_state: state %u not found", state_id); bandit_last_was_used = 0; return; }
 
   state_info_t* st = kh_val(khms_states, k);
-  if (!st || bandit_last_seed_idx >= st->seeds_count) return;
+  if (!st || bandit_last_seed_idx >= st->seeds_count) {
+    BANDIT_LOG("bandit_update_for_state: bad st or idx out of range (idx=%u K=%u)", bandit_last_seed_idx, st ? st->seeds_count : 0);
+    bandit_last_was_used = 0;
+    return;
+  }
 
   ensure_bandit_arrays(st);
   u32 K = st->seeds_count;
-  /* recompute pi for the chosen arm under current weights */
-  double pi = 0.0;
   double sumw = 0.0;
   for (u32 i = 0; i < K; ++i) sumw += st->bandit_w[i];
+
+  double pi = 0.0, denom = 0.0, rhat = 0.0, old_w = st->bandit_w[bandit_last_seed_idx];
+
   if (algo == EXP3) {
-    pi = (1.0 - st->gamma) * (st->bandit_w[bandit_last_seed_idx] / sumw) + st->gamma * (1.0 / (double)K);
-    /* EXP3 update: w_i *= exp(eta * r_hat) with r_hat = r / p_i */
-    double denom = (pi > 1e-12) ? pi : 1e-12;
-    double rhat = reward / denom;
+    pi = (1.0 - st->gamma) * (old_w / sumw) + st->gamma * (1.0 / (double)K);
+    denom = (pi > 1e-12) ? pi : 1e-12;
+    rhat = reward / denom;
     st->bandit_w[bandit_last_seed_idx] *= exp(st->eta * rhat);
-  } else { /* EXP3_IX implicit exploration */
-    /* Sampling p_i is pure weights; Implicit exploration in estimator */
-    double pi_pure = st->bandit_w[bandit_last_seed_idx] / sumw;
-    double denom = pi_pure + st->gamma; /* implicit exploration */
-    if (denom < 1e-12) denom = 1e-12;
-    double rhat = reward / denom;
+    BANDIT_LOG("update: state=%u algo=EXP3 idx=%u reward=%.6f pi=%.6f denom=%.6e rhat=%.6f eta=%.6f w_old=%.6e w_new=%.6e",
+               state_id, bandit_last_seed_idx, reward, pi, denom, rhat, st->eta,
+               old_w, st->bandit_w[bandit_last_seed_idx]);
+  } else {
+    double pi_pure = old_w / sumw;
+    denom = pi_pure + st->gamma; if (denom < 1e-12) denom = 1e-12;
+    rhat = reward / denom;
     st->bandit_w[bandit_last_seed_idx] *= exp(st->eta * rhat);
+    BANDIT_LOG("update: state=%u algo=EXP3_IX idx=%u reward=%.6f pi_pure=%.6f denom=%.6e rhat=%.6f eta=%.6f w_old=%.6e w_new=%.6e",
+               state_id, bandit_last_seed_idx, reward, pi_pure, denom, rhat, st->eta,
+               old_w, st->bandit_w[bandit_last_seed_idx]);
   }
 
-  /* Optional renormalization to keep numbers in check */
-  /* Normalize weights if they get too large */
+  /* Normalize if needed */
   double maxw = 0.0;
   for (u32 i = 0; i < K; ++i) if (st->bandit_w[i] > maxw) maxw = st->bandit_w[i];
   if (maxw > 1e50) {
     for (u32 i = 0; i < K; ++i) st->bandit_w[i] /= maxw;
+    BANDIT_LOG("update: state=%u weights renormalized by maxw=%.6e", state_id, maxw);
   }
 
   st->bandit_rounds++;
+  BANDIT_LOG("update: state=%u rounds=%llu", state_id, (unsigned long long)st->bandit_rounds);
+
   bandit_last_was_used = 0; /* consume the last choice */
 }
 
@@ -899,9 +960,13 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         bandit_last_seed_idx = idx;
         bandit_last_was_used = 1;
 
+        BANDIT_LOG("choose_seed: state=%u algo=%s K=%u idx=%u pi=%.6f seed_index_global=%u fname=%s",
+                  target_state_id, (mode==EXP3?"EXP3":"EXP3_IX"),
+                  state->seeds_count, idx, pi,
+                  result->index, result->fname ? result->fname : "(null)");
+
         break;
       }
-
       default:
         break;
     }
@@ -9647,6 +9712,13 @@ int main(int argc, char** argv) {
       } else if (queued_with_cov > pre_cov) {
         reward = 0.5;
       }
+      BANDIT_LOG("reward: state=%u discovered_delta=%llu cov_delta=%llu uc_delta=%llu uh_delta=%llu reward=%.3f",
+           target_state_id,
+           (unsigned long long)(queued_discovered - pre_discovered),
+           (unsigned long long)(queued_with_cov - pre_cov),
+           (unsigned long long)(unique_crashes - pre_uc),
+           (unsigned long long)(unique_hangs - pre_uh),
+           reward);
 
       /* MAB: update bandit if we used it for the last choice */
       if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_last_was_used) {
@@ -9730,6 +9802,13 @@ int main(int argc, char** argv) {
       } else if (queued_with_cov > pre_cov) {
         reward = 0.5;
       }
+      BANDIT_LOG("reward: state=%u discovered_delta=%llu cov_delta=%llu uc_delta=%llu uh_delta=%llu reward=%.3f",
+           target_state_id,
+           (unsigned long long)(queued_discovered - pre_discovered),
+           (unsigned long long)(queued_with_cov - pre_cov),
+           (unsigned long long)(unique_crashes - pre_uc),
+           (unsigned long long)(unique_hangs - pre_uh),
+           reward);
 
       /* MAB: update bandit if we used it for the last choice */
       if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_last_was_used) {
