@@ -35,7 +35,7 @@ typedef struct {
   double *bandit_w;           /* weights per seed (length = seeds_count) */
   double  gamma;              /* exploration parameter (mixing or implicit) */
   double  eta;                /* learning rate */
-  u32     bandit_rounds       /* number of updates performed */
+  u32     bandit_rounds;      /* number of updates performed */
 
   /* Seed hierarchy and selection tracking */
   u32 selected_count;              /* How many times this seed was selected */
