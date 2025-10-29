@@ -31,18 +31,19 @@ typedef struct {
   void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
   u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
 
-  // Bandits:
-  double *bandit_w;           /* weights per seed (length = seeds_count) */
-  double  gamma;              /* exploration parameter (mixing or implicit) */
-  double  eta;                /* learning rate */
-  u32     bandit_rounds       /* number of updates performed */
+  /* Bandit state for EXP3 / EXP3-IX */
+  double *bandit_w;       /* size = seeds_count, EXP3 / EXP3-IX weights */
+  u32    *bandit_sel_cnt; /* selection count per arm for logging/diagnostics */
 
-  /* Seed hierarchy and selection tracking */
-  u32 selected_count;              /* How many times this seed was selected */
-  u32 parent_index_primary;        /* Primary parent seed index, or 0xFFFFFFFF if none */
-  u32 parent_index_secondary;      /* Secondary parent (for splice), or 0xFFFFFFFF if none */
-  u32 child_count;                 /* Number of children created from this seed */
-  u32* children_indices;           /* Dynamic array [child_count] of child indices */
+  /* Last chosen arm and its probability (for update) */
+  u32     last_selected_seed_index;
+  double  last_selected_p;
+
+  /* Algorithm hyperparameters - can be overridden via env vars: */
+  double  exp3_gamma;   /* default 0.1 */
+  double  exp3_eta;     /* default 0.1 */
+  double  exp3ix_gamma; /* implicit exploration term default 0.1 */
+  double  exp3ix_eta;   /* default 0.1 */
 } state_info_t;
 
 enum {

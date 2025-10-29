@@ -274,6 +274,9 @@ struct queue_entry {
   u8 is_initial_seed;                 /* Is this an initial seed */
   u32 unique_state_count;             /* Unique number of states traversed by this queue entry */
 
+  /* Hierarchy logging */
+  u32 parent_index;                  /* Parent seed index (for seed tree) */
+  u32 times_selected;                /* Number of times this seed was selected */
 };
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
@@ -398,259 +401,133 @@ u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machi
 u8 code_aware_schedule = 0;
 u8 false_negative_reduction = 0;
 
-/* Bandit bookkeeping for last choice */
-static struct queue_entry* bandit_last_seed = NULL;
-static u32 bandit_last_state_id = 0;
-static u32 bandit_last_seed_idx = 0;
-static u8  bandit_last_was_used = 0;   /* was the last seed chosen by bandit? */
-
-/* Bandit helpers */
-static inline double rand01(void) {
-  /* return a double in [0,1) */
-  return (double)random() / ((double)RAND_MAX + 1.0);
-}
-
-static double get_env_double(const char* name, double defv) {
-  char* s = getenv(name);
-  if (!s) return defv;
-  double v = atof(s);
-  if (v > 0.0) return v;
-  return defv;
-}
-
 /* Bandit logging */
-static int bandit_log_fd = 1;
+static FILE* bandit_log_file = NULL;
+static FILE* seed_tree_log_file = NULL;
 
-static void bandit_log_open(void) {
-  if (bandit_log_fd >= 0) return;
-  const char* path_env = getenv("AFLNET_BANDIT_LOG");
-  char path[512];
-  if (path_env && path_env[0]) {
-    snprintf(path, sizeof(path), "%s.%d", path_env, getpid());
-  } else {
-    snprintf(path, sizeof(path), "/tmp/aflnet_bandit_%d.log", getpid());
-  }
-  bandit_log_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+/* --- Bandit helpers for EXP3 / EXP3-IX --- */
+
+static inline double rand_double01(void) {
+  return ((double)random()) / ((double)RAND_MAX);
 }
 
-static void bandit_logf(const char* fmt, ...) {
-  if (bandit_log_fd < 0) bandit_log_open();
-  if (bandit_log_fd < 0) return;
-  char buf[2048];
-  struct timeval tv; gettimeofday(&tv, NULL);
-  int off = snprintf(buf, sizeof(buf), "[%ld.%06ld][pid=%d] ",
-                     (long)tv.tv_sec, (long)tv.tv_usec, getpid());
-  if (off < 0) off = 0;
-  va_list ap; va_start(ap, fmt);
-  int n = vsnprintf(buf + off, sizeof(buf) - off, fmt, ap);
-  va_end(ap);
-  if (n < 0) return;
-  size_t total = off + (size_t)n;
-  if (total >= sizeof(buf)) total = sizeof(buf) - 1;
-  buf[total++] = '\n';
-  (void)!write(bandit_log_fd, buf, total);
-}
-
-/* Helper: dump weights and probabilities for first N arms (capped) */
-static void bandit_dump_weights(state_info_t* st, const char* tag) {
-  if (!st || !st->bandit_w) { bandit_logf("bandit:%s no state or no weights", tag); return; }
-  u32 K = st->seeds_count;
-  double sumw = 0.0; for (u32 i=0; i<K; ++i) sumw += st->bandit_w[i];
-  u32 N = (K > 64) ? 64 : K;
-  bandit_logf("bandit:%s state=%u K=%u sumw=%.6e (showing first %u)", tag, st->id, K, sumw, N);
-  for (u32 i=0; i<N; ++i) {
-    double w = st->bandit_w[i];
-    double pi = (sumw > 0.0) ? (w/sumw) : 0.0;
-    bandit_logf("bandit:%s i=%u w=%.6e pi=%.6f", tag, i, w, pi);
-  }
-}
-
-/* Helper: validate gamma/eta and weights to catch NaNs/Infs */
-static void bandit_check_params(state_info_t* st, const char* where) {
-  if (!st) { bandit_logf("bandit:%s st=NULL", where); return; }
-  double g = st->gamma, e = st->eta;
-  if (!(g >= 0.0 && g <= 1.0)) bandit_logf("bandit:%s WARN gamma out of range: %.6f", where, g);
-  if (!(e > 0.0 && e < 10.0)) bandit_logf("bandit:%s WARN eta unusual: %.6f", where, e);
-  if (!st->bandit_w) { bandit_logf("bandit:%s weights=NULL", where); return; }
-  u32 K = st->seeds_count;
-  double sumw = 0.0; int bad = 0;
-  for (u32 i=0; i<K; ++i) {
-    double w = st->bandit_w[i];
-    if (!(w > 0.0) || isnan(w) || isinf(w)) { bad = 1; bandit_logf("bandit:%s bad weight[%u]=%.6e", where, i, w); }
-    sumw += w;
-  }
-  if (sumw <= 0.0 || isnan(sumw) || isinf(sumw)) bandit_logf("bandit:%s bad sumw=%.6e", where, sumw);
-}
-
-static void ensure_bandit_arrays(state_info_t* st) {
-  if (!st) { bandit_logf("ensure: st=NULL"); return; }
-  if (!st->bandit_w && st->seeds_count) {
-    st->bandit_w = (double*)ck_alloc(st->seeds_count * sizeof(double));
-    for (u32 i = 0; i < st->seeds_count; ++i) st->bandit_w[i] = 1.0;
-    if (st->gamma == 0.0) st->gamma = get_env_double("AFLNET_EXP3_GAMMA", 0.1);
-    if (st->eta   == 0.0) st->eta   = get_env_double("AFLNET_EXP3_ETA",   0.1);
-    if (st->gamma == 0.0) st->gamma = 0.1;
-    if (st->eta   == 0.0) st->eta   = 0.1;
-    if (st->gamma < 0.0) { bandit_logf("ensure: clamping gamma %.6f -> 0.0", st->gamma); st->gamma = 0.0; }
-    if (st->gamma > 0.99) { bandit_logf("ensure: clamping gamma %.6f -> 0.99", st->gamma); st->gamma = 0.99; }
-    if (st->eta <= 0.0) { bandit_logf("ensure: clamping eta %.6f -> 0.1", st->eta); st->eta = 0.1; }
-    if (st->eta > 5.0) { bandit_logf("ensure: clamping eta %.6f -> 5.0", st->eta); st->eta = 5.0; }
-    bandit_logf("ensure: init state=%u K=%u gamma=%.6f eta=%.6f", st->id, st->seeds_count, st->gamma, st->eta);
-    bandit_check_params(st, "ensure:init");
-  } else if (st->bandit_w && st->seeds_count) {
-    double sumw_old = 0.0;
-    for (u32 i=0;i<st->seeds_count;++i) sumw_old += st->bandit_w[i];
-    st->bandit_w = (double*)ck_realloc(st->bandit_w, st->seeds_count * sizeof(double));
-    for (u32 i=0; i<st->seeds_count; ++i) {
-      if (!(st->bandit_w[i] > 0.0) || isnan(st->bandit_w[i]) || isinf(st->bandit_w[i])) {
-        bandit_logf("ensure: reset bad weight[%u]=%.6e to 1.0", i, st->bandit_w[i]);
-        st->bandit_w[i] = 1.0;
-      }
+/* Initialize bandit fields for a state, unless already initialized. */
+static void init_state_bandit(state_info_t* s) {
+  if (!s) return;
+  if (!s->bandit_w && s->seeds_count > 0) {
+    s->bandit_w = (double*)ck_alloc(sizeof(double) * s->seeds_count);
+    s->bandit_sel_cnt = (u32*)ck_alloc(sizeof(u32) * s->seeds_count);
+    for (u32 i = 0; i < s->seeds_count; i++) {
+      s->bandit_w[i] = 1.0;
+      s->bandit_sel_cnt[i] = 0;
     }
-    double sumw_new = 0.0;
-    for (u32 i=0;i<st->seeds_count;++i) sumw_new += st->bandit_w[i];
-    bandit_logf("ensure: extend state=%u K=%u sumw_old=%.6e sumw_new=%.6e", st->id, st->seeds_count, sumw_old, sumw_new);
-    bandit_check_params(st, "ensure:extend");
-  } else {
-    bandit_logf("ensure: state=%u K=%u no weights", st->id, st->seeds_count);
+  }
+  /* Defaults; overridable via env vars */
+  if (s->exp3_gamma == 0.0) {
+    s->exp3_gamma = getenv("EXP3_GAMMA") ? atof(getenv("EXP3_GAMMA")) : 0.1;
+  }
+  if (s->exp3_eta == 0.0) {
+    s->exp3_eta = getenv("EXP3_ETA") ? atof(getenv("EXP3_ETA")) : 0.1;
+  }
+  if (s->exp3ix_gamma == 0.0) {
+    s->exp3ix_gamma = getenv("EXP3IX_GAMMA") ? atof(getenv("EXP3IX_GAMMA")) : 0.1;
+  }
+  if (s->exp3ix_eta == 0.0) {
+    s->exp3ix_eta = getenv("EXP3IX_ETA") ? atof(getenv("EXP3IX_ETA")) : 0.1;
   }
 }
 
-/* Sample an index according to probabilities p_i computed from weights and algorithm */
-static u32 bandit_sample_index(state_info_t* st, u8 algo, double* out_pi) {
-  ensure_bandit_arrays(st);
-  if (!st) { bandit_logf("sample: st=NULL"); return 0; }
-  u32 K = st->seeds_count;
-  if (K == 0) { bandit_logf("sample: state=%u K=0", st->id); return 0; }
+/* Ensure arrays accommodate new seeds appended to state->seeds */
+static void ensure_state_bandit_capacity_on_seed_add(state_info_t* s) {
+  if (!s) return;
+  if (s->seeds_count == 0) return;
+  if (!s->bandit_w) {
+    init_state_bandit(s);
+    return;
+  }
+  /* Resize and init the last arm */
+  s->bandit_w = (double*)ck_realloc(s->bandit_w, sizeof(double) * s->seeds_count);
+  s->bandit_sel_cnt = (u32*)ck_realloc(s->bandit_sel_cnt, sizeof(u32) * s->seeds_count);
+  /* Initialize new slot (last index) */
+  s->bandit_w[s->seeds_count - 1] = 1.0;
+  s->bandit_sel_cnt[s->seeds_count - 1] = 0;
+}
 
-  double sumw = 0.0;
-  for (u32 i=0; i<K; ++i) sumw += st->bandit_w[i];
-  if (!(sumw > 0.0) || isnan(sumw) || isinf(sumw)) {
-    for (u32 i=0;i<K;++i) st->bandit_w[i] = 1.0;
-    sumw = (double)K;
-    bandit_logf("sample: state=%u reset weights due to bad sumw", st->id);
+/* Choose an index via EXP3/EXP3-IX; fills s->last_selected_seed_index and s->last_selected_p */
+static u32 choose_arm_exp3_like(state_info_t* s, u8 algo) {
+  init_state_bandit(s);
+  if (!s->seeds_count) return 0;
+  double sum_w = 0.0;
+  u32 K = s->seeds_count;
+
+  for (u32 i = 0; i < K; i++) sum_w += s->bandit_w[i];
+  if (sum_w <= 0.0) {
+    for (u32 i = 0; i < K; i++) s->bandit_w[i] = 1.0, sum_w += 1.0;
   }
 
-  bandit_dump_weights(st, "pre-sample");
-
-  double u = rand01();
-  double cdf = 0.0;
-  u32 idx = 0;
+  double r = rand_double01();
+  double acc = 0.0;
+  u32 chosen = 0;
 
   if (algo == EXP3) {
-    double mix = st->gamma;
-    for (u32 i=0; i<K; ++i) {
-      double base = st->bandit_w[i] / sumw;
-      double pi = (1.0 - mix) * base + mix * (1.0 / (double)K);
-      if (isnan(pi) || isinf(pi) || pi < 0.0) bandit_logf("sample: EXP3 bad pi[%u]=%.6e base=%.6e", i, pi, base);
-      cdf += pi;
-      if (u <= cdf) {
-        idx = i; if (out_pi) *out_pi = pi;
-        bandit_logf("sample: EXP3 state=%u K=%u sumw=%.6e mix=%.6f u=%.6f idx=%u pi=%.6f cdf=%.6f",
-                    st->id, K, sumw, mix, u, idx, pi, cdf);
-        return idx;
+    double gamma = s->exp3_gamma;
+    /* p_i = (1 - gamma) * w_i / sum_w + gamma / K */
+    for (u32 i = 0; i < K; i++) {
+      double p_i = (1.0 - gamma) * (s->bandit_w[i] / sum_w) + (gamma / (double)K);
+      double next = acc + p_i;
+      if (r < next || i == K - 1) {
+        chosen = i;
+        s->last_selected_p = p_i;
+        break;
       }
+      acc = next;
     }
-    idx = K-1;
-    double pi_last = (1.0 - mix) * (st->bandit_w[idx]/sumw) + mix * (1.0/(double)K);
-    if (out_pi) *out_pi = pi_last;
-    bandit_logf("sample: EXP3 tail idx=%u pi=%.6f u=%.6f cdf=%.6f", idx, pi_last, u, cdf);
-    return idx;
-  } else {
-    for (u32 i=0; i<K; ++i) {
-      double pi = st->bandit_w[i] / sumw;
-      if (isnan(pi) || isinf(pi) || pi < 0.0) bandit_logf("sample: EXP3_IX bad pi[%u]=%.6e", i, pi);
-      cdf += pi;
-      if (u <= cdf) {
-        idx = i; if (out_pi) *out_pi = pi;
-        bandit_logf("sample: EXP3_IX state=%u K=%u sumw=%.6e u=%.6f idx=%u pi=%.6f cdf=%.6f",
-                    st->id, K, sumw, u, idx, pi, cdf);
-        return idx;
+  } else { /* EXP3_IX */
+    /* Use pure weight-proportional selection: p_i = w_i / sum_w */
+    for (u32 i = 0; i < K; i++) {
+      double p_i = s->bandit_w[i] / sum_w;
+      double next = acc + p_i;
+      if (r < next || i == K - 1) {
+        chosen = i;
+        s->last_selected_p = p_i;
+        break;
       }
+      acc = next;
     }
-    idx = K-1; double pi_last = st->bandit_w[idx] / sumw;
-    if (out_pi) *out_pi = pi_last;
-    bandit_logf("sample: EXP3_IX tail idx=%u pi=%.6f u=%.6f cdf=%.6f", idx, pi_last, u, cdf);
-    return idx;
   }
+
+  s->last_selected_seed_index = chosen;
+  s->bandit_sel_cnt[chosen]++;
+  return chosen;
 }
 
-/* Update the bandit after observing reward in [0,1] */
-static void bandit_update_for_state(u32 state_id, u8 algo, double reward) {
-  if (!bandit_last_was_used) { bandit_logf("update: skip (last not bandit-chosen)"); return; }
-  if (state_id != bandit_last_state_id || !bandit_last_seed) {
-    bandit_logf("update: mismatch state=%u last=%u or seed=NULL", state_id, bandit_last_state_id);
-    bandit_last_was_used = 0; return;
+/* EXP3 / EXP3-IX update after observing reward in [0,1]. */
+static void bandit_update_after_round(state_info_t* s, u8 algo, double reward) {
+  if (!s || !s->seeds_count) return;
+  u32 i = s->last_selected_seed_index;
+  double p = s->last_selected_p;
+  if (p <= 0.0) p = 1e-12; /* guard */
+
+  double w_before = s->bandit_w[i];
+  double eta = (algo == EXP3) ? s->exp3_eta : s->exp3ix_eta;
+
+  /* Importance-weighted estimator with (implicit) exploration */
+  double denom = (algo == EXP3) ? p : (p + s->exp3ix_gamma);
+  double xhat = reward / denom;
+
+  s->bandit_w[i] = s->bandit_w[i] * exp(eta * xhat);
+
+  /* Avoid overflow; optional normalization */
+  double sum_w = 0.0;
+  for (u32 j = 0; j < s->seeds_count; j++) sum_w += s->bandit_w[j];
+  if (!isfinite(sum_w) || sum_w <= 0.0) {
+    /* reset to uniform if degenerate */
+    for (u32 j = 0; j < s->seeds_count; j++) s->bandit_w[j] = 1.0;
+    sum_w = (double)s->seeds_count;
   }
 
-  khint_t k = kh_get(hms, khms_states, state_id);
-  if (k == kh_end(khms_states)) { bandit_logf("update: state %u not found", state_id); bandit_last_was_used = 0; return; }
-
-  state_info_t* st = kh_val(khms_states, k);
-  if (!st || bandit_last_seed_idx >= st->seeds_count) {
-    bandit_logf("update: bad st or idx=%u out of range K=%u", bandit_last_seed_idx, st ? st->seeds_count : 0);
-    bandit_last_was_used = 0; return;
-  }
-
-  ensure_bandit_arrays(st);
-  bandit_check_params(st, "update:pre");
-  bandit_dump_weights(st, "pre-update");
-
-  u32 K = st->seeds_count;
-  double sumw = 0.0; for (u32 i=0; i<K; ++i) sumw += st->bandit_w[i];
-  if (!(sumw > 0.0)) { bandit_logf("update: bad sumw=%.6e", sumw); sumw = (double)K; }
-
-  double old_w = st->bandit_w[bandit_last_seed_idx];
-  if (!(old_w > 0.0) || isnan(old_w) || isinf(old_w)) { bandit_logf("update: old_w bad=%.6e reset->1.0", old_w); old_w = 1.0; st->bandit_w[bandit_last_seed_idx] = 1.0; }
-
-  double pi_comp = 0.0, denom = 0.0, rhat = 0.0;
-
-  if (algo == EXP3) {
-    pi_comp = (1.0 - st->gamma) * (old_w / sumw) + st->gamma * (1.0 / (double)K);
-    denom = (pi_comp > 1e-12) ? pi_comp : 1e-12;
-  } else {
-    double pi_pure = old_w / sumw;
-    pi_comp = pi_pure;
-    denom = pi_pure + st->gamma;
-    if (denom < 1e-12) denom = 1e-12;
-  }
-
-  rhat = reward / denom;
-
-  /* Guard against overflow: if eta*rhat huge, cap exp argument */
-  double arg = st->eta * rhat;
-  if (arg > 100.0) { bandit_logf("update: capping exp arg %.6f -> 100.0", arg); arg = 100.0; }
-  if (arg < -100.0) { bandit_logf("update: capping exp arg %.6f -> -100.0", arg); arg = -100.0; }
-
-  double new_w = old_w * exp(arg);
-  if (!isfinite(new_w) || new_w <= 0.0) {
-    bandit_logf("update: new_w invalid %.6e, resetting to 1.0", new_w);
-    new_w = 1.0;
-  }
-  st->bandit_w[bandit_last_seed_idx] = new_w;
-
-  bandit_logf("update: state=%u algo=%s idx=%u reward=%.6f pi=%.6f denom=%.6e rhat=%.6f eta=%.6f w_old=%.6e w_new=%.6e",
-              state_id, (algo==EXP3?"EXP3":"EXP3_IX"), bandit_last_seed_idx, reward, pi_comp, denom, rhat, st->eta, old_w, new_w);
-
-  /* Renormalize if weights explode */
-  double maxw = 0.0; for (u32 i=0; i<K; ++i) if (st->bandit_w[i] > maxw) maxw = st->bandit_w[i];
-  if (maxw > 1e50 || isnan(maxw) || isinf(maxw)) {
-    for (u32 i=0; i<K; ++i) st->bandit_w[i] = (isfinite(st->bandit_w[i]) && st->bandit_w[i] > 0.0) ? (st->bandit_w[i] / maxw) : 1.0;
-    bandit_logf("update: renormalized by maxw=%.6e", maxw);
-  }
-
-  st->bandit_rounds++;
-  bandit_dump_weights(st, "post-update");
-  bandit_check_params(st, "update:post");
-
-  bandit_last_was_used = 0;
-}
-
-/* Helper for seed selection stat tracking */
-static struct queue_entry* get_queue_entry_by_position(u32 pos) {
-  struct queue_entry* p = queue;
-  while (p && pos) { p = p->next; pos--; }
-  return p;
+  /* Logging: we only have w_before and updated sum_w here; caller logs with context */
+  /* We won't print here to keep this helper pure. */
 }
 
 /* Implemented state machine */
@@ -954,9 +831,15 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
       case RANDOM_SELECTION: //Random seed selection
         state->selected_seed_index = UR(state->seeds_count);
         result = state->seeds[state->selected_seed_index];
+        if (result) {
+          result->times_selected++;
+        }
         break;
       case ROUND_ROBIN: //Round-robin seed selection
         result = state->seeds[state->selected_seed_index];
+        if (result) {
+          result->times_selected++;
+        }
         state->selected_seed_index++;
         if (state->selected_seed_index == state->seeds_count) state->selected_seed_index = 0;
         break;
@@ -967,6 +850,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
           u32 passed_cycles = 0;
           while (passed_cycles < 5) {
             result = state->seeds[state->selected_seed_index];
+            if (result) {
+              result->times_selected++;
+            }
             if (state->selected_seed_index + 1 == state->seeds_count) {
               state->selected_seed_index = 0;
               passed_cycles++;
@@ -1002,43 +888,26 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         } else {
           //Do Round-robin if seeds_count of the selected state is small
           result = state->seeds[state->selected_seed_index];
+          if (result) {
+            result->times_selected++;
+          }
           state->selected_seed_index++;
           if (state->selected_seed_index == state->seeds_count) state->selected_seed_index = 0;
         }
         break;
       case EXP3:
       case EXP3_IX: {
-        ensure_bandit_arrays(state);
-        bandit_logf("choose_seed: state=%u algo=%s seeds_count=%u", target_state_id, (mode==EXP3?"EXP3":"EXP3_IX"), state->seeds_count);
-        if (state->seeds_count == 0) { bandit_logf("choose_seed: no seeds for state=%u", target_state_id); return NULL; }
+        /* Bandit-based selection among state->seeds */
+        init_state_bandit(state);
+        if (state->seeds_count == 0) return NULL;
 
-        /* Validate seeds[] pointers */
-        for (u32 i=0; i<state->seeds_count; ++i) {
-          if (!state->seeds[i]) bandit_logf("choose_seed: WARN seeds[%u]=NULL", i);
+        /* Choose an arm index via EXP3/EXP3-IX */
+        u32 arm_idx = choose_arm_exp3_like(state, mode);
+        state->selected_seed_index = arm_idx; /* for compatibility */
+        result = (struct queue_entry*) state->seeds[arm_idx];
+        if (result) {
+          result->times_selected++; /* Track how many times seed selected */
         }
-
-        bandit_dump_weights(state, "pre-sample");
-        double pi = 0.0;
-        u32 idx = bandit_sample_index(state, mode, &pi);
-
-        if (idx >= state->seeds_count) {
-          bandit_logf("choose_seed: idx=%u out of range K=%u", idx, state->seeds_count);
-          idx = state->seeds_count - 1;
-        }
-        result = (struct queue_entry*)state->seeds[idx];
-        if (!result) {
-          bandit_logf("choose_seed: selected seed NULL at idx=%u", idx);
-          return NULL;
-        }
-
-        result->selected_count++;
-        bandit_last_seed = result;
-        bandit_last_state_id = target_state_id;
-        bandit_last_seed_idx = idx;
-        bandit_last_was_used = 1;
-
-        bandit_logf("choose_seed: picked idx=%u pi=%.6f global_index=%u fname=%s",
-                    idx, pi, result->index, result->fname ? result->fname : "(null)");
         break;
       }
       default:
@@ -1185,6 +1054,7 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
     state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
     state->seeds[state->seeds_count] = (void *)q;
     state->seeds_count++;
+    ensure_state_bandit_capacity_on_seed_add(state);
 
     was_fuzzed_map[0][q->index] = 0; //Mark it as reachable but not fuzzed
   } else {
@@ -1204,6 +1074,8 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
         state->seeds[state->seeds_count] = (void *)q;
         state->seeds_count++;
+        ensure_state_bandit_capacity_on_seed_add(state);
+
       } else {
         //XXX. This branch is supposed to be not reachable
         //However, due to some undeterminism, new state could be seen during regions' annotating process
@@ -1224,6 +1096,7 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
         newState->seeds[0] = (void *)q;
         newState->seeds_count = 1;
+        ensure_state_bandit_capacity_on_seed_add(newState);
 
         k = kh_put(hms, khms_states, reachable_state_id, &discard);
         kh_value(khms_states, k) = newState;
@@ -1876,12 +1749,9 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->generating_state_id = target_state_id;
   q->is_initial_seed = 0;
 
-  // hierarchy tracking
-  q->selected_count       = 0;
-  q->parent_index_primary = 0xFFFFFFFF;
-  q->parent_index_secondary = 0xFFFFFFFF;
-  q->child_count          = 0;
-  q->children_indices     = NULL;
+  /* Hierarchy logging */
+  q->parent_index = 0xFFFFFFFF; /* Default to no parent; updated later if applicable */
+  q->times_selected = 0;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -1966,61 +1836,9 @@ EXP_ST void destroy_queue(void) {
     ck_free(q);
     q = n;
 
-    /* Free seed selection stat tracking structures */
-    if (q->children_indices) ck_free(q->children_indices);
-    ck_free(q);
-    q = n;
   }
 
 }
-
-/* Write seed hierarchy to file */
-static void write_seed_hierarchy_dot(void) {
-  s32 fd;
-  u8* fn = alloc_printf("%s/seed_hierarchy.dot", out_dir);
-  fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0) { WARNF("Unable to create '%s'", fn); ck_free(fn); return; }
-
-  FILE* f = fdopen(fd, "w");
-  if (!f) { close(fd); ck_free(fn); return; }
-
-  fprintf(f, "digraph seed_hierarchy {\n");
-  fprintf(f, "  node [shape=box, fontsize=10];\n");
-
-  /* Emit nodes with labels */
-  struct queue_entry* q = queue;
-  while (q) {
-    fprintf(f, "  s%u [label=\"id:%06u\\nsel:%u\\nlen:%u\"];\n",
-            q->index, q->index, q->selected_count, q->len);
-    q = q->next;
-  }
-
-  /* Emit edges parent -> child */
-  q = queue;
-  while (q) {
-    for (u32 i = 0; i < q->child_count; ++i) {
-      fprintf(f, "  s%u -> s%u;\n", q->index, q->children_indices[i]);
-    }
-    /* Optional: draw secondary parent edges dashed */
-    /* We can iterate all seeds again to add dashed edges for secondary parents */
-    q = q->next;
-  }
-
-  /* Dashed edges for secondary parents */
-  q = queue;
-  while (q) {
-    if (q->parent_index_secondary != 0xFFFFFFFF) {
-      fprintf(f, "  s%u -> s%u [style=dashed, color=gray];\n",
-              q->parent_index_secondary, q->index);
-    }
-    q = q->next;
-  }
-
-  fprintf(f, "}\n");
-  fclose(f);
-  ck_free(fn);
-}
-
 
 
 /* Write bitmap to file. The bitmap is useful mostly for the secret
@@ -3722,18 +3540,7 @@ static u8 run_target(char** argv, u32 timeout) {
 static void write_to_testcase(void* mem, u32 len) {
 
   //AFLNet sends data via network so it does not need this function
-  //Actually it seems ProFuzzBench needs this function so let's add it back:
-  s32 fd = out_fd;
-  if (out_file) {
-    unlink(out_file); /* Ignore errors. */
-    fd = open(out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) PFATAL("Unable to create '%s'", out_file);
-  } else lseek(fd, 0, SEEK_SET);
-  ck_write(fd, mem, len, out_file);
-  if (!out_file) {
-    if (ftruncate(fd, len)) PFATAL("ftruncate() failed");
-    lseek(fd, 0, SEEK_SET);
-  } else close(fd);
+
 }
 
 static void show_stats(void);
@@ -4377,6 +4184,16 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     /* We use the actual length of all messages (full_len), not the len of the mutated message subsequence (len)*/
     add_to_queue(fn, full_len, 0);
 
+    /* Set parent and log the relationship for the seed tree */
+    if (queue_cur && queue_top) {
+      /* queue_cur is the seed being fuzzed; queue_top is the newly enqueued seed */
+      queue_top->parent_index = queue_cur->index;
+      if (seed_tree_log_file) {
+        fprintf(seed_tree_log_file, "%u -> %u\n", queue_cur->index, queue_top->index);
+        fflush(seed_tree_log_file);
+      }
+    }
+
     if (state_aware_mode) update_state_aware_variables(queue_top, 0);
 
     /* save the seed to file for replaying */
@@ -4405,31 +4222,6 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     close(fd);*/
 
     keeping = 1;
-
-     add_to_queue(fn, full_len, 0);
-    /* queue_top now points to the newly added seed */
-
-    /* Set parent info for hierarchy */
-    if (queue_cur) {
-      queue_top->parent_index_primary = queue_cur->index;
-
-      /* Append new child to parent’s children list */
-      queue_cur->children_indices = (u32*)ck_realloc(
-          queue_cur->children_indices, (queue_cur->child_count + 1) * sizeof(u32));
-      queue_cur->children_indices[queue_cur->child_count++] = queue_top->index;
-    }
-
-    /* Secondary parent if splicing was involved */
-    if (splicing_with >= 0) {
-      struct queue_entry* sp_parent = get_queue_entry_by_position((u32)splicing_with);
-      if (sp_parent) {
-        queue_top->parent_index_secondary = sp_parent->index;
-        /* Append child to the splice parent’s children list */
-        sp_parent->children_indices = (u32*)ck_realloc(
-            sp_parent->children_indices, (sp_parent->child_count + 1) * sizeof(u32));
-        sp_parent->children_indices[sp_parent->child_count++] = queue_top->index;
-      }
-    }
 
   }
 
@@ -6214,10 +6006,6 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
    skipped or bailed out. */
 
 static u8 fuzz_one(char** argv) {
-  /* Count that this seed was selected to fuzz */
-  if (queue_cur) {
-    queue_cur->selected_count++;
-  }
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf = NULL, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
@@ -8657,6 +8445,32 @@ EXP_ST void setup_dirs_fds(void) {
                      "unique_hangs, max_depth, execs_per_sec, n_nodes, n_edges\n");
                      /* ignore errors */
 
+  /* Bandit logging */
+  {
+    u8* bfn = alloc_printf("%s/bandit_log.csv", out_dir);
+    s32 bfd = open(bfn, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (bfd < 0) PFATAL("Unable to create '%s'", bfn);
+    ck_free(bfn);
+    bandit_log_file = fdopen(bfd, "w");
+    if (!bandit_log_file) PFATAL("fdopen() failed for bandit_log.csv");
+    /* CSV header */
+    fprintf(bandit_log_file,
+      "time_ms,state_id,algo,K,chosen_idx,seed_global_idx,p_selected,reward,w_before,w_after,sum_w_after,qp_before,qp_after,cr_before,cr_after,hang_before,hang_after\n");
+    fflush(bandit_log_file);
+  }
+
+  /* Hierarchy logging */
+  {
+    u8* tfn = alloc_printf("%s/seed_tree.log", out_dir);
+    s32 tfd = open(tfn, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (tfd < 0) PFATAL("Unable to create '%s'", tfn);
+    ck_free(tfn);
+    seed_tree_log_file = fdopen(tfd, "w");
+    if (!seed_tree_log_file) PFATAL("fdopen() failed for seed_tree.log");
+    /* Simple header */
+    fprintf(seed_tree_log_file, "# parent_index -> child_index\n");
+    fflush(seed_tree_log_file);
+  }
 }
 
 
@@ -9227,10 +9041,6 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  bandit_log_open();
-  bandit_logf("bandit: logger started");
-
-
   while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:")) > 0)
 
     switch (opt) {
@@ -9774,37 +9584,68 @@ int main(int argc, char** argv) {
 
         }
       }
-      
-      /* MAB: baselines for reward */
-      u64 pre_discovered = queued_discovered;
-      u64 pre_cov        = queued_with_cov;
-      u64 pre_uc         = unique_crashes;
-      u64 pre_uh         = unique_hangs;
+
+      /* Bandit: snapshot counters for reward */
+      u64 bandit_qp_before = queued_paths;
+      u64 bandit_cr_before = unique_crashes;
+      u64 bandit_hg_before = unique_hangs;
+
+      /* and capture selection context for logging & update */
+      u32 bandit_state_id = target_state_id;
+      struct queue_entry *bandit_selected_seed = selected_seed;
 
       skipped_fuzz = fuzz_one(use_argv);
 
-      /* MAB: compute reward in [0,1] */
       double reward = 0.0;
-      if (queued_discovered > pre_discovered || unique_crashes > pre_uc || unique_hangs > pre_uh) reward = 1.0;
-      else if (queued_with_cov > pre_cov) reward = 0.5;
-      bandit_logf("reward: state=%u delta_discovered=%lld delta_cov=%lld delta_uc=%lld delta_uh=%lld reward=%.3f",
-                  target_state_id,
-                  (long long)(queued_discovered - pre_discovered),
-                  (long long)(queued_with_cov - pre_cov),
-                  (long long)(unique_crashes - pre_uc),
-                  (long long)(unique_hangs - pre_uh),
-                  reward);
+      if (unique_crashes > bandit_cr_before) reward = 1.0;
+      else if (queued_paths > bandit_qp_before) reward = 1.0;
+      else if (unique_hangs > bandit_hg_before) reward = 0.5;
+      else reward = 0.0;
 
-      if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_last_was_used) {
-        bandit_logf("update_call: state=%u algo=%u", target_state_id, seed_selection_algo);
-        bandit_update_for_state(target_state_id, seed_selection_algo, reward);
-      } else {
-        bandit_logf("update_call: skipped (algo=%u used=%u)", seed_selection_algo, bandit_last_was_used);
-      }
+      /* If EXP3/EXP3-IX, update bandit and log */
+      if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_selected_seed) {
+        khint_t kB = kh_get(hms, khms_states, bandit_state_id);
+        if (kB != kh_end(khms_states)) {
+          state_info_t* st = kh_val(khms_states, kB);
+          if (st && st->seeds_count > 0) {
+            /* Log weights before update for the chosen arm */
+            double w_before = 0.0, sum_w_after = 0.0;
+            u32 chosen_arm = st->last_selected_seed_index;
+            if (st->bandit_w && chosen_arm < st->seeds_count) {
+              w_before = st->bandit_w[chosen_arm];
+            }
 
-      /* MAB: update bandit if we used it for the last choice */
-      if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_last_was_used) {
-        bandit_update_for_state(target_state_id, seed_selection_algo, reward);
+            bandit_update_after_round(st, seed_selection_algo, reward);
+
+            /* compute sum_w_after and selected weight */
+            double w_after = 0.0;
+            for (u32 ti = 0; ti < st->seeds_count; ti++) sum_w_after += st->bandit_w[ti];
+            if (st->bandit_w && chosen_arm < st->seeds_count) {
+              w_after = st->bandit_w[chosen_arm];
+            }
+
+            if (bandit_log_file) {
+              fprintf(bandit_log_file,
+                "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                get_cur_time(),                            /* time_ms */
+                bandit_state_id,                           /* state_id */
+                (seed_selection_algo == EXP3 ? "EXP3" : "EXP3-IX"), /* algo */
+                st->seeds_count,                           /* K */
+                chosen_arm,                                /* chosen_idx */
+                bandit_selected_seed->index,               /* seed_global_idx */
+                st->last_selected_p,                       /* p_selected */
+                reward,                                    /* reward */
+                w_before,                                  /* w_before */
+                w_after,                                   /* w_after */
+                sum_w_after,                               /* sum_w_after */
+                bandit_qp_before, queued_paths,
+                bandit_cr_before, unique_crashes,
+                bandit_hg_before, unique_hangs
+              );
+              fflush(bandit_log_file);
+            }
+          }
+        }
       }
 
       if (!stop_soon && sync_id && !skipped_fuzz) {
@@ -9869,33 +9710,69 @@ int main(int argc, char** argv) {
         }
       }
 
-      /* MAB: baselines for reward */
-      u64 pre_discovered = queued_discovered;
-      u64 pre_cov        = queued_with_cov;
-      u64 pre_uc         = unique_crashes;
-      u64 pre_uh         = unique_hangs;
+      /* Bandit: snapshot counters for reward */
+      u64 bandit_qp_before = queued_paths;
+      u64 bandit_cr_before = unique_crashes;
+      u64 bandit_hg_before = unique_hangs;
+
+      /* and capture selection context for logging & update */
+      u32 bandit_state_id = target_state_id;
+      struct queue_entry *bandit_selected_seed = selected_seed;
 
       skipped_fuzz = fuzz_one(use_argv);
 
-      /* MAB: compute reward in [0,1] */
       double reward = 0.0;
-      if (queued_discovered > pre_discovered || unique_crashes > pre_uc || unique_hangs > pre_uh) {
-        reward = 1.0;
-      } else if (queued_with_cov > pre_cov) {
-        reward = 0.5;
-      }
-      BANDIT_LOG("reward: state=%u discovered_delta=%llu cov_delta=%llu uc_delta=%llu uh_delta=%llu reward=%.3f",
-           target_state_id,
-           (unsigned long long)(queued_discovered - pre_discovered),
-           (unsigned long long)(queued_with_cov - pre_cov),
-           (unsigned long long)(unique_crashes - pre_uc),
-           (unsigned long long)(unique_hangs - pre_uh),
-           reward);
+      if (unique_crashes > bandit_cr_before) reward = 1.0;
+      else if (queued_paths > bandit_qp_before) reward = 1.0;
+      else if (unique_hangs > bandit_hg_before) reward = 0.5;
+      else reward = 0.0;
 
-      /* MAB: update bandit if we used it for the last choice */
-      if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_last_was_used) {
-        bandit_update_for_state(target_state_id, seed_selection_algo, reward);
+      /* If EXP3/EXP3-IX, update bandit and log */
+      if ((seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) && bandit_selected_seed) {
+        khint_t kB = kh_get(hms, khms_states, bandit_state_id);
+        if (kB != kh_end(khms_states)) {
+          state_info_t* st = kh_val(khms_states, kB);
+          if (st && st->seeds_count > 0) {
+            /* Log weights before update for the chosen arm */
+            double w_before = 0.0, sum_w_after = 0.0;
+            u32 chosen_arm = st->last_selected_seed_index;
+            if (st->bandit_w && chosen_arm < st->seeds_count) {
+              w_before = st->bandit_w[chosen_arm];
+            }
+
+            bandit_update_after_round(st, seed_selection_algo, reward);
+
+            /* compute sum_w_after and selected weight */
+            double w_after = 0.0;
+            for (u32 ti = 0; ti < st->seeds_count; ti++) sum_w_after += st->bandit_w[ti];
+            if (st->bandit_w && chosen_arm < st->seeds_count) {
+              w_after = st->bandit_w[chosen_arm];
+            }
+
+            if (bandit_log_file) {
+              fprintf(bandit_log_file,
+                "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                get_cur_time(),                            /* time_ms */
+                bandit_state_id,                           /* state_id */
+                (seed_selection_algo == EXP3 ? "EXP3" : "EXP3-IX"), /* algo */
+                st->seeds_count,                           /* K */
+                chosen_arm,                                /* chosen_idx */
+                bandit_selected_seed->index,               /* seed_global_idx */
+                st->last_selected_p,                       /* p_selected */
+                reward,                                    /* reward */
+                w_before,                                  /* w_before */
+                w_after,                                   /* w_after */
+                sum_w_after,                               /* sum_w_after */
+                bandit_qp_before, queued_paths,
+                bandit_cr_before, unique_crashes,
+                bandit_hg_before, unique_hangs
+              );
+              fflush(bandit_log_file);
+            }
+          }
+        }
       }
+
 
       if (!stop_soon && sync_id && !skipped_fuzz) {
 
@@ -9986,8 +9863,6 @@ int main(int argc, char** argv) {
   write_bitmap();
   write_stats_file(0, 0, 0);
   save_auto();
-  
-  write_seed_hierarchy_dot();
 
 stop_fuzzing:
 
