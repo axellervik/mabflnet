@@ -508,7 +508,7 @@ static void bandit_update_after_round(state_info_t* s, u8 algo, double reward) {
   double p = s->last_selected_p;
   if (p <= 0.0) p = 1e-12; /* guard */
 
-  double w_before = s->bandit_w[i];
+  // double w_before = s->bandit_w[i];
   double eta = (algo == EXP3) ? s->exp3_eta : s->exp3ix_eta;
 
   /* Importance-weighted estimator with (implicit) exploration */
@@ -9604,7 +9604,8 @@ int main(int argc, char** argv) {
 
       /* and capture selection context for logging & update */
       u32 bandit_state_id = target_state_id;
-      struct queue_entry *bandit_selected_seed = selected_seed;
+      // if (selected_seed)
+      struct queue_entry *bandit_selected_seed = queue_cur; // = selected_seed;
 
       skipped_fuzz = fuzz_one(use_argv);
 
@@ -9638,7 +9639,7 @@ int main(int argc, char** argv) {
 
             if (bandit_log_file) {
               fprintf(bandit_log_file,
-                "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%u,%llu,%llu,%llu,%llu\n",
                 get_cur_time(),                            /* time_ms */
                 bandit_state_id,                           /* state_id */
                 (seed_selection_algo == EXP3 ? "EXP3" : "EXP3-IX"), /* algo */
@@ -9763,7 +9764,7 @@ int main(int argc, char** argv) {
 
             if (bandit_log_file) {
               fprintf(bandit_log_file,
-                "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%u,%llu,%llu,%llu,%llu\n",
                 get_cur_time(),                            /* time_ms */
                 bandit_state_id,                           /* state_id */
                 (seed_selection_algo == EXP3 ? "EXP3" : "EXP3-IX"), /* algo */
