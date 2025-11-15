@@ -1273,12 +1273,12 @@ int send_over_network()
   total_response_bytes += response_buf_size;
   if (likely_buggy) total_likely_buggy_flags++;
 
-  if (message_log_file) {
-    fprintf(message_log_file,
-    "%llu,%llu,%llu,%llu,%llu\n",
-    time_ms, seed_idx, messages_sent, response_buf_size, likely_buggy.)
-    fflush(message_log_file);
-  }
+  // if (message_log_file) {
+  //   fprintf(message_log_file,
+  //   "%llu,%llu,%llu,%llu,%llu\n",
+  //   get_cur_time(), seed_idx, messages_sent, response_buf_size, likely_buggy)
+  //   fflush(message_log_file);
+  // }
 
 HANDLE_RESPONSES:
 
