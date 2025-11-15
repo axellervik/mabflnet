@@ -9735,7 +9735,8 @@ int main(int argc, char** argv) {
             for (u32 ti = 0; ti < K; ti++) sum_w_after += st->bandit_w[ti];
             if (st->bandit_w && chosen_idx < K) w_after = st->bandit_w[chosen_idx];
           } else {
-            chosen_idx = get_seed_idx_in_state(st, bandit_selected_seed);
+            // chosen_idx = get_seed_idx_in_state(st, bandit_selected_seed);
+            chosen_idx = st->last_selected_seed_index;
             p_est = (K ? (1.0 / (double)K) : 0.0);
             // No weights for non-bandit algos:
             w_before = 0.0; w_after = 0.0; sum_w_after = 0.0;
@@ -9904,7 +9905,8 @@ int main(int argc, char** argv) {
             for (u32 ti = 0; ti < K; ti++) sum_w_after += st->bandit_w[ti];
             if (st->bandit_w && chosen_idx < K) w_after = st->bandit_w[chosen_idx];
           } else {
-            chosen_idx = get_seed_idx_in_state(st, bandit_selected_seed);
+            // chosen_idx = get_seed_idx_in_state(st, bandit_selected_seed);
+            chosen_idx = st->last_selected_seed_index;
             p_est = (K ? (1.0 / (double)K) : 0.0);
             // No weights for non-bandit algos:
             w_before = 0.0; w_after = 0.0; sum_w_after = 0.0;
