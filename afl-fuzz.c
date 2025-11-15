@@ -277,7 +277,16 @@ struct queue_entry {
   /* Hierarchy logging */
   u32 parent_index;                  /* Parent seed index (for seed tree) */
   u32 times_selected;                /* Number of times this seed was selected */
+
+  u32 exec_attempts;
 };
+
+EXP_ST u64 total_seed_selections = 0;
+EXP_ST u64 total_targets_run = 0;
+
+EXP_ST u64 total_messages_sent = 0;
+EXP_ST u64 total_response_bytes = 0;
+EXP_ST u64 total_likely_buggy_flags = 0;
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
@@ -403,6 +412,7 @@ u8 false_negative_reduction = 0;
 
 /* Bandit logging */
 static FILE* bandit_log_file = NULL;
+static FILE* message_log_file = NULL;
 static FILE* seed_tree_log_file = NULL;
 
 /* --- Bandit helpers for EXP3 / EXP3-IX --- */
@@ -833,12 +843,14 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         result = state->seeds[state->selected_seed_index];
         if (result) {
           result->times_selected++;
+          total_seed_selections++;
         }
         break;
       case ROUND_ROBIN: //Round-robin seed selection
         result = state->seeds[state->selected_seed_index];
         if (result) {
           result->times_selected++;
+          total_seed_selections++;
         }
         state->selected_seed_index++;
         if (state->selected_seed_index == state->seeds_count) state->selected_seed_index = 0;
@@ -852,6 +864,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
             result = state->seeds[state->selected_seed_index];
             if (result) {
               result->times_selected++;
+              total_seed_selections++;
             }
             if (state->selected_seed_index + 1 == state->seeds_count) {
               state->selected_seed_index = 0;
@@ -890,6 +903,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
           result = state->seeds[state->selected_seed_index];
           if (result) {
             result->times_selected++;
+            total_seed_selections++;
           }
           state->selected_seed_index++;
           if (state->selected_seed_index == state->seeds_count) state->selected_seed_index = 0;
@@ -906,7 +920,8 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         state->selected_seed_index = arm_idx; /* for compatibility */
         result = (struct queue_entry*) state->seeds[arm_idx];
         if (result) {
-          result->times_selected++; /* Track how many times seed selected */
+          result->times_selected++;
+          total_seed_selections++;
         }
         break;
       }
@@ -1252,6 +1267,17 @@ int send_over_network()
     //it could be a signal of a potentiall server crash, like the case of CVE-2019-7314
     if (prev_buf_size == response_buf_size) likely_buggy = 1;
     else likely_buggy = 0;
+  }
+
+  total_messages_sent += messages_sent;
+  total_response_bytes += response_buf_size;
+  if (likely_buggy) total_likely_buggy_flags++;
+
+  if (message_log_file) {
+    fprintf(message_log_file,
+    "%llu,%llu,%llu,%llu,%llu\n",
+    time_ms, seed_idx, messages_sent, response_buf_size, likely_buggy.)
+    fflush(message_log_file);
   }
 
 HANDLE_RESPONSES:
@@ -1752,6 +1778,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   /* Hierarchy logging */
   q->parent_index = 0xFFFFFFFF; /* Default to no parent; updated later if applicable */
   q->times_selected = 0;
+
+  q->exec_attempts = 0;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -3312,6 +3340,7 @@ EXP_ST void init_forkserver(char** argv) {
    information. The called program will update trace_bits[]. */
 
 static u8 run_target(char** argv, u32 timeout) {
+  total_targets_run++;
 
   static struct itimerval it;
   static u32 prev_timed_out = 0;
@@ -4503,7 +4532,9 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              "afl_version       : " VERSION "\n"
              "target_mode       : %s%s%s%s%s%s%s\n"
              "command_line      : %s\n"
-             "slowest_exec_ms   : %llu\n",
+             "slowest_exec_ms   : %llu\n"
+             "# seed selections : %llu\n"
+             "# runs            : %llu\n",
              start_time / 1000, get_cur_time() / 1000, getpid(),
              queue_cycle ? (queue_cycle - 1) : 0, total_execs, eps,
              queued_paths, queued_favored, queued_discovered, queued_imported,
@@ -4517,7 +4548,8 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
              persistent_mode ? "persistent " : "", deferred_mode ? "deferred " : "",
              (qemu_mode || dumb_mode || no_forkserver || crash_mode ||
               persistent_mode || deferred_mode) ? "" : "default",
-             orig_cmdline, slowest_exec_ms);
+             orig_cmdline, slowest_exec_ms,
+             total_seed_selections, total_targets_run);
              /* ignore errors */
 
   /* Get rss value from the children
@@ -6018,6 +6050,8 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
    skipped or bailed out. */
 
 static u8 fuzz_one(char** argv) {
+
+  queue_cur->exec_attempts++;
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf = NULL, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
@@ -8471,6 +8505,20 @@ EXP_ST void setup_dirs_fds(void) {
     fflush(bandit_log_file);
   }
 
+    /* Message logging */
+  {
+    u8* bfn = alloc_printf("%s/message_log.csv", out_dir);
+    s32 bfd = open(bfn, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (bfd < 0) PFATAL("Unable to create '%s'", bfn);
+    ck_free(bfn);
+    message_log_file = fdopen(bfd, "w");
+    if (!message_log_file) PFATAL("fdopen() failed for message_log.csv");
+    /* CSV header */
+    fprintf(message_log_file,
+    "time_ms,seed_idx,messages_sent,response_buf_size,likely_buggy.\n");
+    fflush(message_log_file);
+  }
+
   /* Hierarchy logging */
   {
     u8* tfn = alloc_printf("%s/seed_tree.log", out_dir);
@@ -9661,6 +9709,50 @@ int main(int argc, char** argv) {
         }
       }
 
+      // Common logging for all algos:
+      if (bandit_log_file) {
+        const char* algo_name =
+          (seed_selection_algo == EXP3)    ? "EXP3" :
+          (seed_selection_algo == EXP3_IX) ? "EXP3-IX" :
+          (seed_selection_algo == RANDOM_SELECTION) ? "RANDOM" :
+          (seed_selection_algo == ROUND_ROBIN)      ? "ROUND_ROBIN" :
+          (seed_selection_algo == FAVOR)            ? "FAVOR" :
+          "UNKNOWN";
+
+        u32 K = 0, chosen_idx = 0;
+        double p_est = 0.0, w_before = 0.0, w_after = 0.0, sum_w_after = 0.0;
+
+        khint_t kB = kh_get(hms, khms_states, bandit_state_id);
+        if (kB != kh_end(khms_states)) {
+          state_info_t* st = kh_val(khms_states, kB);
+          K = st ? st->seeds_count : 0;
+
+          if (seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) {
+            chosen_idx    = st->last_selected_seed_index;
+            p_est         = st->last_selected_p;
+            if (st->bandit_w && chosen_idx < K) w_before = st->bandit_w[chosen_idx];
+            // update was already performed; recompute current weight sums:
+            for (u32 ti = 0; ti < K; ti++) sum_w_after += st->bandit_w[ti];
+            if (st->bandit_w && chosen_idx < K) w_after = st->bandit_w[chosen_idx];
+          } else {
+            chosen_idx = get_seed_idx_in_state(st, bandit_selected_seed);
+            p_est = (K ? (1.0 / (double)K) : 0.0);
+            // No weights for non-bandit algos:
+            w_before = 0.0; w_after = 0.0; sum_w_after = 0.0;
+          }
+        }
+
+        fprintf(bandit_log_file,
+          "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%u,%llu,%llu,%llu,%llu\n",
+          get_cur_time(), bandit_state_id, algo_name, K, chosen_idx,
+          bandit_selected_seed ? bandit_selected_seed->index : 0xFFFFFFFF,
+          p_est, reward, w_before, w_after, sum_w_after,
+          bandit_qp_before, queued_paths, bandit_cr_before, unique_crashes,
+          bandit_hg_before, unique_hangs
+        );
+        fflush(bandit_log_file);
+      }
+
       if (!stop_soon && sync_id && !skipped_fuzz) {
 
         if (!(sync_interval_cnt++ % SYNC_INTERVAL))
@@ -9784,6 +9876,50 @@ int main(int argc, char** argv) {
             }
           }
         }
+      }
+
+      // Common logging for all algos:
+      if (bandit_log_file) {
+        const char* algo_name =
+          (seed_selection_algo == EXP3)    ? "EXP3" :
+          (seed_selection_algo == EXP3_IX) ? "EXP3-IX" :
+          (seed_selection_algo == RANDOM_SELECTION) ? "RANDOM" :
+          (seed_selection_algo == ROUND_ROBIN)      ? "ROUND_ROBIN" :
+          (seed_selection_algo == FAVOR)            ? "FAVOR" :
+          "UNKNOWN";
+
+        u32 K = 0, chosen_idx = 0;
+        double p_est = 0.0, w_before = 0.0, w_after = 0.0, sum_w_after = 0.0;
+
+        khint_t kB = kh_get(hms, khms_states, bandit_state_id);
+        if (kB != kh_end(khms_states)) {
+          state_info_t* st = kh_val(khms_states, kB);
+          K = st ? st->seeds_count : 0;
+
+          if (seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX) {
+            chosen_idx    = st->last_selected_seed_index;
+            p_est         = st->last_selected_p;
+            if (st->bandit_w && chosen_idx < K) w_before = st->bandit_w[chosen_idx];
+            // update was already performed; recompute current weight sums:
+            for (u32 ti = 0; ti < K; ti++) sum_w_after += st->bandit_w[ti];
+            if (st->bandit_w && chosen_idx < K) w_after = st->bandit_w[chosen_idx];
+          } else {
+            chosen_idx = get_seed_idx_in_state(st, bandit_selected_seed);
+            p_est = (K ? (1.0 / (double)K) : 0.0);
+            // No weights for non-bandit algos:
+            w_before = 0.0; w_after = 0.0; sum_w_after = 0.0;
+          }
+        }
+
+        fprintf(bandit_log_file,
+          "%llu,%u,%s,%u,%u,%u,%f,%f,%f,%f,%f,%llu,%u,%llu,%llu,%llu,%llu\n",
+          get_cur_time(), bandit_state_id, algo_name, K, chosen_idx,
+          bandit_selected_seed ? bandit_selected_seed->index : 0xFFFFFFFF,
+          p_est, reward, w_before, w_after, sum_w_after,
+          bandit_qp_before, queued_paths, bandit_cr_before, unique_crashes,
+          bandit_hg_before, unique_hangs
+        );
+        fflush(bandit_log_file);
       }
 
 
