@@ -88,8 +88,8 @@
 
 /* Baseline number of random tweaks during a single 'havoc' stage: */
 
-#define HAVOC_CYCLES        256
-#define HAVOC_CYCLES_INIT   1024
+#define HAVOC_CYCLES        64
+#define HAVOC_CYCLES_INIT   128
 
 /* Maximum multiplier for the above (should be a power of two, beware
    of 32-bit int overflows): */
@@ -98,7 +98,7 @@
 
 /* Absolute minimum number of havoc cycles (after all adjustments): */
 
-#define HAVOC_MIN           16
+#define HAVOC_MIN           8
 
 /* Maximum stacking for havoc-stage tweaks. The actual value is calculated
    like this: 
@@ -109,7 +109,7 @@
    In other words, the default (n = 7) produces 2, 4, 8, 16, 32, 64, or
    128 stacked tweaks: */
 
-#define HAVOC_STACK_POW2    7
+#define HAVOC_STACK_POW2    4
 
 /* Caps on block sizes for cloning and deletion operations. Each of these
    ranges has a 33% probability of getting picked, except for the first
@@ -136,7 +136,7 @@
 
 /* Nominal per-splice havoc cycle length: */
 
-#define SPLICE_HAVOC        32
+#define SPLICE_HAVOC        8
 
 /* Maximum offset for integer addition / subtraction stages: */
 
