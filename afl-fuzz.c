@@ -682,6 +682,145 @@ unsigned int choose_target_state(u8 mode) {
   return result;
 }
 
+/* EXP3 algorithm for seed selection */
+static u32 exp3_select_seed(state_info_t *state, u32 target_state_id)
+{
+  u32 K = state->seeds_count;
+  if (K == 0) return 0;
+  
+  /* Compute exploration-exploitation parameter */
+  u32 T = state->mab_total_selections + 1; /* Predicted total time horizon */
+  double gamma = fmin(1.0, sqrt((double)K * log(K) / (2.71828 * T)));
+  
+  /* Compute cumulative probability distribution */
+  double *weights = state->mab_weights;
+  double W = 0.0;
+  for (u32 i = 0; i < K; i++) W += weights[i];
+  
+  double rand_val = ((double)random() / RAND_MAX);
+  double cum_prob = 0.0;
+  
+  for (u32 i = 0; i < K; i++) {
+    double prob_i = (1.0 - gamma) * (weights[i] / W) + (gamma / K);
+    cum_prob += prob_i;
+    if (rand_val <= cum_prob) return i;
+  }
+  return K - 1; /* Fallback to last arm if numerical error */
+}
+
+/* EXP3-IX algorithm for seed selection (bias-corrected) */
+static u32 exp3_ix_select_seed(state_info_t *state, u32 target_state_id)
+{
+  u32 K = state->seeds_count;
+  if (K == 0) return 0;
+  
+  /* Same arm selection as EXP3 */
+  return exp3_select_seed(state, target_state_id);
+}
+
+/* Sleeping Bandit: only "awake" arms (relevant seeds) are eligible */
+static u32 sleeping_bandit_select_seed(state_info_t *state, u32 target_state_id)
+{
+  u32 K = state->seeds_count;
+  if (K == 0) return 0;
+  
+  /* Build awake set: seeds generated for this state or initial seeds */
+  u32 awake_count = 0;
+  u32 awake_indices[K];
+  
+  for (u32 i = 0; i < K; i++) {
+    struct queue_entry *seed = (struct queue_entry *)state->seeds[i];
+    if (seed->generating_state_id == target_state_id || seed->is_initial_seed) {
+      awake_indices[awake_count++] = i;
+    }
+  }
+  
+  /* If no awake seeds, fall back to round-robin over all seeds */
+  if (awake_count == 0) {
+    return state->selected_seed_index;
+  }
+  
+  /* Apply EXP3 over awake set only */
+  double W = 0.0;
+  for (u32 j = 0; j < awake_count; j++) {
+    W += state->mab_weights[awake_indices[j]];
+  }
+  
+  double rand_val = ((double)random() / RAND_MAX);
+  double cum_prob = 0.0;
+  
+  u32 T = state->mab_total_selections + 1;
+  double gamma = fmin(1.0, sqrt((double)awake_count * log(awake_count) / (2.71828 * T)));
+  
+  for (u32 j = 0; j < awake_count; j++) {
+    u32 idx = awake_indices[j];
+    double prob_j = (1.0 - gamma) * (state->mab_weights[idx] / W) + (gamma / awake_count);
+    cum_prob += prob_j;
+    if (rand_val <= cum_prob) return idx;
+  }
+  return awake_indices[awake_count - 1]; /* Fallback */
+}
+
+/* Update MAB weights after receiving reward signal */
+static void update_mab_weights(state_info_t *state, u32 selected_index, u8 reward, u8 algo)
+{
+  u32 K = state->seeds_count;
+  if (K == 0 || selected_index >= K) return;
+  
+  state->mab_total_selections++;
+  
+  if (algo == EXP3) {
+    /* EXP3 update: w[i] *= exp(gamma * r / (K * p[i])) */
+    u32 T = state->mab_total_selections;
+    double gamma = fmin(1.0, sqrt((double)K * log(K) / (2.71828 * T)));
+    
+    double W = 0.0;
+    for (u32 i = 0; i < K; i++) W += state->mab_weights[i];
+    
+    double prob_selected = (1.0 - gamma) * (state->mab_weights[selected_index] / W) + (gamma / K);
+    double eta = gamma / K; /* Learning rate */
+    double x_hat = (double)reward / prob_selected; /* Unbiased reward estimate */
+    
+    state->mab_weights[selected_index] *= exp(eta * x_hat);
+  }
+  else if (algo == EXP3_IX) {
+    /* EXP3-IX uses a corrected estimator and normalized updates */
+    u32 T = state->mab_total_selections;
+    double gamma = fmin(1.0, sqrt((double)K * log(K) / (2.71828 * T)));
+    
+    double W = 0.0;
+    for (u32 i = 0; i < K; i++) W += state->mab_weights[i];
+    
+    double prob_selected = (1.0 - gamma) * (state->mab_weights[selected_index] / W) + (gamma / K);
+    double eta = sqrt(log(K) / (2.71828 * T * K)); /* Adaptive learning rate */
+    double x_hat = (double)reward / (prob_selected + gamma); /* Bias-corrected estimator */
+    
+    state->mab_weights[selected_index] *= exp(eta * x_hat / K);
+  }
+  else if (algo == SLEEPING_BANDIT) {
+    /* Sleeping Bandit uses EXP3 on awake set */
+    u32 awake_count = 0;
+    for (u32 i = 0; i < K; i++) {
+      struct queue_entry *seed = (struct queue_entry *)state->seeds[i];
+      if (seed->generating_state_id == state->id || seed->is_initial_seed) awake_count++;
+    }
+    
+    if (awake_count == 0) return; /* No update if no awake arms */
+    
+    u32 T = state->mab_total_selections;
+    double gamma = fmin(1.0, sqrt((double)awake_count * log(awake_count) / (2.71828 * T)));
+    
+    double W = 0.0;
+    for (u32 i = 0; i < K; i++) W += state->mab_weights[i];
+    
+    double prob_selected = (1.0 - gamma) * (state->mab_weights[selected_index] / W) + (gamma / awake_count);
+    double eta = gamma / awake_count;
+    double x_hat = (double)reward / prob_selected;
+    
+    state->mab_weights[selected_index] *= exp(eta * x_hat);
+  }
+}
+
 /* Select a seed to exercise the target state */
 struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 {
@@ -751,15 +890,36 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
           if (state->selected_seed_index == state->seeds_count) state->selected_seed_index = 0;
         }
         break;
-      default:
-        break;
-    }
-  } else {
-    PFATAL("AFLNet - the states hashtable has no entries for state %d", target_state_id);
-  }
+       case EXP3: /* EXP3 Multi-Armed Bandit seed selection */
+         {
+           u32 selected_index = exp3_select_seed(state, target_state_id);
+           state->selected_seed_index = selected_index;
+           result = state->seeds[selected_index];
+         }
+         break;
+       case EXP3_IX: /* EXP3-IX (bias-corrected) seed selection */
+         {
+           u32 selected_index = exp3_ix_select_seed(state, target_state_id);
+           state->selected_seed_index = selected_index;
+           result = state->seeds[selected_index];
+         }
+         break;
+       case SLEEPING_BANDIT: /* Sleeping Bandit seed selection */
+         {
+           u32 selected_index = sleeping_bandit_select_seed(state, target_state_id);
+           state->selected_seed_index = selected_index;
+           result = state->seeds[selected_index];
+         }
+         break;
+       default:
+         break;
+     }
+   } else {
+     PFATAL("AFLNet - the states hashtable has no entries for state %d", target_state_id);
+   }
 
-  return result;
-}
+   return result;
+ }
 
 /* Update state-aware variables */
 void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
@@ -811,6 +971,8 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
           newState_From->selected_seed_index = 0;
           newState_From->seeds = NULL;
           newState_From->seeds_count = 0;
+          newState_From->mab_weights = NULL;
+          newState_From->mab_total_selections = 0;
 
           k = kh_put(hms, khms_states, prevStateID, &discard);
           kh_value(khms_states, k) = newState_From;
@@ -841,6 +1003,8 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
           newState_To->selected_seed_index = 0;
           newState_To->seeds = NULL;
           newState_To->seeds_count = 0;
+          newState_To->mab_weights = NULL;
+          newState_To->mab_total_selections = 0;
 
           k = kh_put(hms, khms_states, curStateID, &discard);
           kh_value(khms_states, k) = newState_To;
@@ -893,7 +1057,9 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
   if (k != kh_end(khms_states)) {
     state = kh_val(khms_states, k);
     state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
+    state->mab_weights = (double *) ck_realloc (state->mab_weights, (state->seeds_count + 1) * sizeof(double));
     state->seeds[state->seeds_count] = (void *)q;
+    state->mab_weights[state->seeds_count] = 1.0; /* Initialize new weight to 1.0 */
     state->seeds_count++;
 
     was_fuzzed_map[0][q->index] = 0; //Mark it as reachable but not fuzzed
@@ -912,7 +1078,9 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
       if (k != kh_end(khms_states)) {
         state = kh_val(khms_states, k);
         state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
+        state->mab_weights = (double *) ck_realloc (state->mab_weights, (state->seeds_count + 1) * sizeof(double));
         state->seeds[state->seeds_count] = (void *)q;
+        state->mab_weights[state->seeds_count] = 1.0; /* Initialize new weight to 1.0 */
         state->seeds_count++;
       } else {
         //XXX. This branch is supposed to be not reachable
@@ -921,19 +1089,23 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         //To completely fix this, we should fix all causes leading to potential undeterminism
         //For now, we just add the state into the hashtable
 
-        state_info_t *newState = (state_info_t *) ck_alloc (sizeof(state_info_t));
-        newState->id = reachable_state_id;
-        newState->is_covered = 1;
-        newState->paths = 0;
-        newState->paths_discovered = 0;
-        newState->selected_times = 0;
-        newState->fuzzs = 0;
-        newState->score = 1;
-        newState->selected_seed_index = 0;
-        newState->seeds = NULL;
-        newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
-        newState->seeds[0] = (void *)q;
-        newState->seeds_count = 1;
+         state_info_t *newState = (state_info_t *) ck_alloc (sizeof(state_info_t));
+         newState->id = reachable_state_id;
+         newState->is_covered = 1;
+         newState->paths = 0;
+         newState->paths_discovered = 0;
+         newState->selected_times = 0;
+         newState->fuzzs = 0;
+         newState->score = 1;
+         newState->selected_seed_index = 0;
+         newState->seeds = NULL;
+         newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
+         newState->seeds[0] = (void *)q;
+         newState->seeds_count = 1;
+         newState->mab_weights = NULL;
+         newState->mab_weights = (double *) ck_realloc (newState->mab_weights, sizeof(double));
+         newState->mab_weights[0] = 1.0;
+         newState->mab_total_selections = 0;
 
         k = kh_put(hms, khms_states, reachable_state_id, &discard);
         kh_value(khms_states, k) = newState;
@@ -8131,8 +8303,8 @@ static void usage(u8* argv0) {
        "  -R            - enable region-level mutation operators (see README.md)\n"
        "  -F            - enable false negative reduction mode (see README.md)\n"
        "  -c cleanup    - name or full path to the server cleanup script (see README.md)\n"
-       "  -q algo       - state selection algorithm (See aflnet.h for all available options)\n"
-       "  -s algo       - seed selection algorithm (See aflnet.h for all available options)\n"
+        "  -q algo       - state selection algorithm (1=RANDOM, 2=ROUND_ROBIN, 3=FAVOR)\n"
+        "  -s algo       - seed selection algorithm (1=RANDOM, 2=ROUND_ROBIN, 3=FAVOR, 4=EXP3, 5=EXP3-IX, 6=SLEEPING_BANDIT)\n"
        "  -b algo       - feedback type (See aflnet.h for all available options)\n"
        "  -h algo       - seed schedule type (See aflnet.h for all available options)\n\n"
 
@@ -9401,26 +9573,39 @@ int main(int argc, char** argv) {
           prev_queued = queued_paths;
 
         }
-      }
+       }
 
-      skipped_fuzz = fuzz_one(use_argv);
+       /* Track queued_paths before fuzzing for reward signal */
+       u32 prev_queued_paths = queued_paths;
+       
+       skipped_fuzz = fuzz_one(use_argv);
+       
+       /* Update MAB weights with reward signal (1 if new path found, 0 otherwise) */
+       if (state_aware_mode && (seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX || seed_selection_algo == SLEEPING_BANDIT)) {
+         u8 reward = (queued_paths > prev_queued_paths) ? 1 : 0;
+         khint_t k = kh_get(hms, khms_states, target_state_id);
+         if (k != kh_end(khms_states)) {
+           state_info_t *state = kh_val(khms_states, k);
+           update_mab_weights(state, state->selected_seed_index, reward, seed_selection_algo);
+         }
+       }
 
-      if (!stop_soon && sync_id && !skipped_fuzz) {
+       if (!stop_soon && sync_id && !skipped_fuzz) {
 
-        if (!(sync_interval_cnt++ % SYNC_INTERVAL))
-          sync_fuzzers(use_argv);
+         if (!(sync_interval_cnt++ % SYNC_INTERVAL))
+           sync_fuzzers(use_argv);
 
-      }
+       }
 
-      if (!stop_soon && exit_1) stop_soon = 2;
+       if (!stop_soon && exit_1) stop_soon = 2;
 
-      if (stop_soon) break;
+       if (stop_soon) break;
 
-      if (code_aware_schedule){
-        queue_cur = queue_cur->next;
-        current_entry++;
-      }
-    }
+       if (code_aware_schedule){
+         queue_cur = queue_cur->next;
+         current_entry++;
+       }
+     }
 
   } else if (seed_schedule_type == IPSM_SCHEDULE){
     code_aware_schedule = 0;
@@ -9465,23 +9650,36 @@ int main(int argc, char** argv) {
             queue_cycle++;
           }
         }
-      }
+       }
 
-      skipped_fuzz = fuzz_one(use_argv);
+       /* Track queued_paths before fuzzing for reward signal */
+       u32 prev_queued_paths_ipsm = queued_paths;
+       
+       skipped_fuzz = fuzz_one(use_argv);
+       
+       /* Update MAB weights with reward signal (1 if new path found, 0 otherwise) */
+       if (state_aware_mode && (seed_selection_algo == EXP3 || seed_selection_algo == EXP3_IX || seed_selection_algo == SLEEPING_BANDIT)) {
+         u8 reward = (queued_paths > prev_queued_paths_ipsm) ? 1 : 0;
+         khint_t k = kh_get(hms, khms_states, target_state_id);
+         if (k != kh_end(khms_states)) {
+           state_info_t *state = kh_val(khms_states, k);
+           update_mab_weights(state, state->selected_seed_index, reward, seed_selection_algo);
+         }
+       }
 
-      if (!stop_soon && sync_id && !skipped_fuzz) {
+       if (!stop_soon && sync_id && !skipped_fuzz) {
 
-        if (!(sync_interval_cnt++ % SYNC_INTERVAL))
-          sync_fuzzers(use_argv);
+         if (!(sync_interval_cnt++ % SYNC_INTERVAL))
+           sync_fuzzers(use_argv);
 
-      }
+       }
 
-      if (!stop_soon && exit_1) stop_soon = 2;
+       if (!stop_soon && exit_1) stop_soon = 2;
 
-      if (stop_soon) break;
-    }
-  }
-  else {
+       if (stop_soon) break;
+     }
+   }
+   else {
     while (1) {
       u8 skipped_fuzz;
 

@@ -30,6 +30,9 @@ typedef struct {
   u32 selected_seed_index;    /* the recently selected seed index */
   void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
   u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
+  /* MAB-related fields */
+  double *mab_weights;        /* EXP3/EXP3-IX arm weights, size = seeds_count */
+  u32 mab_total_selections;   /* Total number of seed selections in this state (for learning rate scheduling) */
 } state_info_t;
 
 enum {
@@ -41,7 +44,10 @@ enum {
   /* 00 */ INVALID_SELECTION,
   /* 01 */ RANDOM_SELECTION,
   /* 02 */ ROUND_ROBIN,
-  /* 03 */ FAVOR
+  /* 03 */ FAVOR,
+  /* 04 */ EXP3,
+  /* 05 */ EXP3_IX,
+  /* 06 */ SLEEPING_BANDIT
 };
 
 enum {
