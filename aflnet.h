@@ -19,6 +19,14 @@ typedef struct {
   int msize;   /* Message size */
 } message_t;
 
+/* Per-arm data for MAB seed selection algorithms (one entry per seed in state->seeds[]) */
+typedef struct {
+  double  log_weight;        /* EXP3/EXP3-IX: log-space weight (initialised to 0.0 = weight 1.0) */
+  u64     last_selected;     /* Sleeping Bandit: fuzzing round when this arm was last pulled */
+  u64     total_reward_bits; /* Accumulated new-bit reward (integer, scaled by 1e6) */
+  u32     pull_count;        /* Number of times this arm has been selected */
+} mab_arm_t;
+
 typedef struct {
   u32 id;                     /* state id */
   u8 is_covered;              /* has this state been covered */
@@ -30,6 +38,8 @@ typedef struct {
   u32 selected_seed_index;    /* the recently selected seed index */
   void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
   u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
+  mab_arm_t *mab_arms;        /* MAB per-arm data, length == seeds_count (NULL until first MAB call) */
+  u64 mab_round;              /* Number of MAB pulls performed for this state so far */
 } state_info_t;
 
 enum {
@@ -41,7 +51,11 @@ enum {
   /* 00 */ INVALID_SELECTION,
   /* 01 */ RANDOM_SELECTION,
   /* 02 */ ROUND_ROBIN,
-  /* 03 */ FAVOR
+  /* 03 */ FAVOR,
+  /* 04 */ EXP3,
+  /* 05 */ EXP3IX,
+  /* 06 */ SLEEPING_BANDIT,
+  /* 07 */ SLEEPING_BANDIT_IX
 };
 
 enum {

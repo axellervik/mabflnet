@@ -438,7 +438,7 @@ void destroy_ipsm()
   kh_destroy(hs32, khs_ipsm_paths);
 
   state_info_t *state;
-  kh_foreach_value(khms_states, state, {ck_free(state->seeds); ck_free(state);});
+  kh_foreach_value(khms_states, state, {ck_free(state->seeds); ck_free(state->mab_arms); ck_free(state);});
   kh_destroy(hms, khms_states);
 
   ck_free(state_ids);
@@ -682,6 +682,218 @@ unsigned int choose_target_state(u8 mode) {
   return result;
 }
 
+/* -------------------------------------------------------------------------
+ * MAB helper: initialise per-arm data for a state if not yet done.
+ * Called at the start of every MAB choose_seed() invocation so that arms
+ * added after the first call (new seeds discovered mid-run) are handled.
+ * ------------------------------------------------------------------------- */
+static void mab_ensure_arms(state_info_t *state) {
+  if (state->mab_arms == NULL && state->seeds_count > 0) {
+    state->mab_arms = (mab_arm_t *)ck_alloc(state->seeds_count * sizeof(mab_arm_t));
+    memset(state->mab_arms, 0, state->seeds_count * sizeof(mab_arm_t));
+    /* log_weight = 0.0  =>  weight = exp(0) = 1.0 for all arms */
+  } else if (state->mab_arms != NULL && state->seeds_count > state->mab_round) {
+    /* seeds_count may have grown; reallocate and zero new entries */
+    u32 old_count = 0;
+    /* count existing initialised arms by scanning for any non-zero pull */
+    for (old_count = 0; old_count < state->seeds_count; old_count++) {
+      if (state->mab_arms[old_count].pull_count == 0 &&
+          state->mab_arms[old_count].log_weight == 0.0 &&
+          old_count > 0) break;
+    }
+    if (old_count < state->seeds_count) {
+      state->mab_arms = (mab_arm_t *)ck_realloc(state->mab_arms,
+                          state->seeds_count * sizeof(mab_arm_t));
+      memset(&state->mab_arms[old_count], 0,
+             (state->seeds_count - old_count) * sizeof(mab_arm_t));
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------
+ * MAB reward update.  Called from the main fuzzing loop immediately after
+ * fuzz_one() returns, when a MAB algorithm is active.
+ *
+ * reward = (new edges discovered during this fuzz_one call) / MAP_SIZE
+ *          clamped to [0, 1].
+ *
+ * We detect "new edges" via the change in the count of non-255 bytes in
+ * virgin_bits before vs. after fuzz_one (the caller snapshots the before
+ * count and passes it here).
+ * ------------------------------------------------------------------------- */
+void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
+                       u32 edges_before, u32 edges_after) {
+  khint_t k = kh_get(hms, khms_states, target_state_id);
+  if (k == kh_end(khms_states)) return;
+  state_info_t *state = kh_val(khms_states, k);
+
+  mab_ensure_arms(state);
+  if (!state->mab_arms || seed_index >= state->seeds_count) return;
+
+  mab_arm_t *arm = &state->mab_arms[seed_index];
+
+  /* reward in [0,1]: fraction of new edges found this round */
+  double reward = 0.0;
+  if (edges_after > edges_before) {
+    reward = (double)(edges_after - edges_before) / (double)MAP_SIZE;
+    if (reward > 1.0) reward = 1.0;
+  }
+
+  u32 K = state->seeds_count;
+  u64 t = state->mab_round; /* round index before this pull (>=1 after first pull) */
+  if (t == 0) t = 1;
+
+  double p_i; /* probability used when this arm was drawn */
+
+  switch (mode) {
+
+    case EXP3: {
+      /* Reconstruct the probability that was used when we drew this arm.
+       * gamma = min(1, sqrt(K * ln(K+1) / ((e-1) * t)))
+       * p_i   = (1-gamma)*exp(w_i)/sum_exp_w + gamma/K
+       * We do not store p_i explicitly, so we recompute sum_exp_w now.
+       * Note: the weight update has NOT been applied yet, so the weights
+       * still reflect the state at draw time.
+       */
+      double gamma = sqrt((double)K * log((double)(K + 1)) /
+                          ((M_E - 1.0) * (double)t));
+      if (gamma > 1.0) gamma = 1.0;
+
+      double sum_exp_w = 0.0;
+      for (u32 i = 0; i < K; i++)
+        sum_exp_w += exp(state->mab_arms[i].log_weight);
+
+      double exp_wi = exp(arm->log_weight);
+      p_i = (1.0 - gamma) * (exp_wi / sum_exp_w) + gamma / (double)K;
+      if (p_i < 1e-12) p_i = 1e-12;
+
+      /* Weight update: w_i <- w_i + gamma * (r / p_i) / K */
+      double update = gamma * (reward / p_i) / (double)K;
+      arm->log_weight += update;
+
+      /* Normalise weights periodically to prevent overflow:
+       * subtract the maximum log-weight from all arms. */
+      if (arm->log_weight > 500.0) {
+        double max_lw = arm->log_weight;
+        for (u32 i = 0; i < K; i++)
+          if (state->mab_arms[i].log_weight > max_lw)
+            max_lw = state->mab_arms[i].log_weight;
+        for (u32 i = 0; i < K; i++)
+          state->mab_arms[i].log_weight -= max_lw;
+      }
+      break;
+    }
+
+    case EXP3IX: {
+      /* EXP3-IX (implicit exploration):
+       * eta  = sqrt(ln(K) / (K * t))
+       * p_i  = exp(w_i) / sum_exp_w           (no explicit mixing)
+       * update: w_i += eta * reward / p_i
+       * The IX bonus (eta/p_i) is absorbed into the learning rate.
+       */
+      double eta = sqrt(log((double)(K + 1)) / ((double)K * (double)t));
+
+      double sum_exp_w = 0.0;
+      for (u32 i = 0; i < K; i++)
+        sum_exp_w += exp(state->mab_arms[i].log_weight);
+
+      double exp_wi = exp(arm->log_weight);
+      p_i = exp_wi / sum_exp_w;
+      if (p_i < 1e-12) p_i = 1e-12;
+
+      arm->log_weight += eta * reward / p_i;
+
+      /* Normalise */
+      if (arm->log_weight > 500.0) {
+        double max_lw = arm->log_weight;
+        for (u32 i = 0; i < K; i++)
+          if (state->mab_arms[i].log_weight > max_lw)
+            max_lw = state->mab_arms[i].log_weight;
+        for (u32 i = 0; i < K; i++)
+          state->mab_arms[i].log_weight -= max_lw;
+      }
+      break;
+    }
+
+    case SLEEPING_BANDIT:
+      /* For Sleeping Bandit we use the same EXP3-style weight update but only
+       * over the active (awake) arms.  The update is identical to EXP3 but K
+       * is replaced by K_active = number of awake arms at draw time.
+       * We stored K_active in arm->total_reward_bits (temporarily) during
+       * choose_seed(); retrieve and clear it here. */
+      {
+        u32 K_active = (u32)(arm->total_reward_bits >> 32);
+        if (K_active == 0) K_active = K; /* fallback */
+        arm->total_reward_bits &= 0xFFFFFFFFULL; /* clear upper 32 bits */
+
+        double gamma = sqrt((double)K_active * log((double)(K_active + 1)) /
+                            ((M_E - 1.0) * (double)t));
+        if (gamma > 1.0) gamma = 1.0;
+
+        double sum_exp_w = 0.0;
+        for (u32 i = 0; i < K; i++)
+          sum_exp_w += exp(state->mab_arms[i].log_weight);
+
+        double exp_wi = exp(arm->log_weight);
+        p_i = (1.0 - gamma) * (exp_wi / sum_exp_w) + gamma / (double)K_active;
+        if (p_i < 1e-12) p_i = 1e-12;
+
+        double update = gamma * (reward / p_i) / (double)K_active;
+        arm->log_weight += update;
+
+        if (arm->log_weight > 500.0) {
+          double max_lw = arm->log_weight;
+          for (u32 i = 0; i < K; i++)
+            if (state->mab_arms[i].log_weight > max_lw)
+              max_lw = state->mab_arms[i].log_weight;
+          for (u32 i = 0; i < K; i++)
+            state->mab_arms[i].log_weight -= max_lw;
+        }
+      }
+      break;
+
+    case SLEEPING_BANDIT_IX: {
+      /* Sleeping Bandit with EXP3-IX weight update.
+       * Same active-arm gating as SLEEPING_BANDIT, but uses the IX implicit
+       * exploration update: w_i += eta * reward / p_i (no uniform mixing).
+       * K_active is stored in upper 32 bits of total_reward_bits by choose_seed(). */
+      u32 K_active = (u32)(arm->total_reward_bits >> 32);
+      if (K_active == 0) K_active = K;
+      arm->total_reward_bits &= 0xFFFFFFFFULL;
+
+      double eta = sqrt(log((double)(K_active + 1)) /
+                        ((double)K_active * (double)t));
+
+      double sum_exp_w = 0.0;
+      for (u32 i = 0; i < K; i++)
+        sum_exp_w += exp(state->mab_arms[i].log_weight);
+
+      double exp_wi = exp(arm->log_weight);
+      p_i = exp_wi / sum_exp_w;
+      if (p_i < 1e-12) p_i = 1e-12;
+
+      arm->log_weight += eta * reward / p_i;
+
+      if (arm->log_weight > 500.0) {
+        double max_lw = arm->log_weight;
+        for (u32 i = 0; i < K; i++)
+          if (state->mab_arms[i].log_weight > max_lw)
+            max_lw = state->mab_arms[i].log_weight;
+        for (u32 i = 0; i < K; i++)
+          state->mab_arms[i].log_weight -= max_lw;
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  arm->pull_count++;
+  arm->last_selected = state->mab_round;
+  state->mab_round++;
+}
+
 /* Select a seed to exercise the target state */
 struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 {
@@ -751,6 +963,182 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
           if (state->selected_seed_index == state->seeds_count) state->selected_seed_index = 0;
         }
         break;
+
+      case EXP3: {
+        /* EXP3 seed selection.
+         * Draw arm i with probability:
+         *   p_i = (1-gamma)*exp(w_i)/sum_exp_w + gamma/K
+         * where gamma = min(1, sqrt(K*ln(K+1)/((e-1)*t))).
+         * Use the inverse-CDF method on a uniform sample.
+         */
+        mab_ensure_arms(state);
+        u32 K = state->seeds_count;
+        u64 t = state->mab_round + 1;
+
+        double gamma = sqrt((double)K * log((double)(K + 1)) /
+                            ((M_E - 1.0) * (double)t));
+        if (gamma > 1.0) gamma = 1.0;
+
+        double sum_exp_w = 0.0;
+        for (u32 i = 0; i < K; i++)
+          sum_exp_w += exp(state->mab_arms[i].log_weight);
+
+        /* Build CDF and sample */
+        double r = (double)UR(1000000) / 1000000.0;
+        double cumul = 0.0;
+        u32 chosen = 0;
+        for (u32 i = 0; i < K; i++) {
+          double p_i = (1.0 - gamma) * (exp(state->mab_arms[i].log_weight) / sum_exp_w)
+                       + gamma / (double)K;
+          cumul += p_i;
+          if (r <= cumul) { chosen = i; break; }
+          chosen = i; /* fallback: last arm */
+        }
+        state->selected_seed_index = chosen;
+        result = state->seeds[chosen];
+        break;
+      }
+
+      case EXP3IX: {
+        /* EXP3-IX: pure softmax draw, no uniform mixing.
+         * p_i = exp(w_i) / sum_exp_w
+         */
+        mab_ensure_arms(state);
+        u32 K = state->seeds_count;
+
+        double sum_exp_w = 0.0;
+        for (u32 i = 0; i < K; i++)
+          sum_exp_w += exp(state->mab_arms[i].log_weight);
+
+        double r = (double)UR(1000000) / 1000000.0;
+        double cumul = 0.0;
+        u32 chosen = 0;
+        for (u32 i = 0; i < K; i++) {
+          double p_i = exp(state->mab_arms[i].log_weight) / sum_exp_w;
+          cumul += p_i;
+          if (r <= cumul) { chosen = i; break; }
+          chosen = i;
+        }
+        state->selected_seed_index = chosen;
+        result = state->seeds[chosen];
+        break;
+      }
+
+      case SLEEPING_BANDIT: {
+        /* Sleeping Bandit (EXP3-S variant).
+         * An arm is "awake" if it was selected within the last SLEEP_WINDOW
+         * rounds, OR if it has never been selected (pull_count == 0).
+         * We run EXP3 restricted to the awake set.
+         * If no arms are awake, all arms are treated as awake (full reset).
+         *
+         * K_active is stored temporarily in the upper 32 bits of
+         * arm->total_reward_bits so mab_update_reward() can retrieve it.
+         */
+        mab_ensure_arms(state);
+
+#define SLEEP_WINDOW 500ULL
+
+        u32 K = state->seeds_count;
+        u64 t = state->mab_round + 1;
+
+        /* Count awake arms */
+        u32 K_active = 0;
+        for (u32 i = 0; i < K; i++) {
+          if (state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW)
+            K_active++;
+        }
+        if (K_active == 0) K_active = K; /* all asleep → wake all */
+
+        double gamma = sqrt((double)K_active * log((double)(K_active + 1)) /
+                            ((M_E - 1.0) * (double)t));
+        if (gamma > 1.0) gamma = 1.0;
+
+        /* Sum weights over awake arms only */
+        double sum_exp_w = 0.0;
+        for (u32 i = 0; i < K; i++) {
+          if (state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+              K_active == K)
+            sum_exp_w += exp(state->mab_arms[i].log_weight);
+        }
+
+        double r = (double)UR(1000000) / 1000000.0;
+        double cumul = 0.0;
+        u32 chosen = K - 1; /* fallback */
+        for (u32 i = 0; i < K; i++) {
+          u8 awake = (state->mab_arms[i].pull_count == 0 ||
+                      (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+                      K_active == K);
+          if (!awake) continue;
+          double p_i = (1.0 - gamma) * (exp(state->mab_arms[i].log_weight) / sum_exp_w)
+                       + gamma / (double)K_active;
+          cumul += p_i;
+          if (r <= cumul) { chosen = i; break; }
+          chosen = i;
+        }
+
+        /* Temporarily store K_active in upper 32 bits for reward update */
+        state->mab_arms[chosen].total_reward_bits =
+            (state->mab_arms[chosen].total_reward_bits & 0xFFFFFFFFULL) |
+            ((u64)K_active << 32);
+
+        state->selected_seed_index = chosen;
+        result = state->seeds[chosen];
+        break;
+      }
+
+      case SLEEPING_BANDIT_IX: {
+        /* Sleeping Bandit with EXP3-IX draw: pure softmax over awake arms.
+         * Active-arm gating is identical to SLEEPING_BANDIT (SLEEP_WINDOW rounds).
+         * K_active is stored in upper 32 bits of total_reward_bits for mab_update_reward(). */
+        mab_ensure_arms(state);
+
+        u32 K = state->seeds_count;
+
+        /* Count awake arms */
+        u32 K_active = 0;
+        for (u32 i = 0; i < K; i++) {
+          if (state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW)
+            K_active++;
+        }
+        if (K_active == 0) K_active = K;
+
+        /* Sum weights over awake arms */
+        double sum_exp_w = 0.0;
+        for (u32 i = 0; i < K; i++) {
+          if (state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+              K_active == K)
+            sum_exp_w += exp(state->mab_arms[i].log_weight);
+        }
+
+        /* Pure softmax draw over awake arms */
+        double r = (double)UR(1000000) / 1000000.0;
+        double cumul = 0.0;
+        u32 chosen = K - 1;
+        for (u32 i = 0; i < K; i++) {
+          u8 awake = (state->mab_arms[i].pull_count == 0 ||
+                      (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+                      K_active == K);
+          if (!awake) continue;
+          double p_i = exp(state->mab_arms[i].log_weight) / sum_exp_w;
+          cumul += p_i;
+          if (r <= cumul) { chosen = i; break; }
+          chosen = i;
+        }
+
+        /* Store K_active in upper 32 bits for reward update */
+        state->mab_arms[chosen].total_reward_bits =
+            (state->mab_arms[chosen].total_reward_bits & 0xFFFFFFFFULL) |
+            ((u64)K_active << 32);
+
+        state->selected_seed_index = chosen;
+        result = state->seeds[chosen];
+        break;
+      }
+
       default:
         break;
     }
@@ -811,6 +1199,8 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
           newState_From->selected_seed_index = 0;
           newState_From->seeds = NULL;
           newState_From->seeds_count = 0;
+          newState_From->mab_arms = NULL;
+          newState_From->mab_round = 0;
 
           k = kh_put(hms, khms_states, prevStateID, &discard);
           kh_value(khms_states, k) = newState_From;
@@ -841,6 +1231,8 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
           newState_To->selected_seed_index = 0;
           newState_To->seeds = NULL;
           newState_To->seeds_count = 0;
+          newState_To->mab_arms = NULL;
+          newState_To->mab_round = 0;
 
           k = kh_put(hms, khms_states, curStateID, &discard);
           kh_value(khms_states, k) = newState_To;
@@ -934,6 +1326,8 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
         newState->seeds[0] = (void *)q;
         newState->seeds_count = 1;
+        newState->mab_arms = NULL;
+        newState->mab_round = 0;
 
         k = kh_put(hms, khms_states, reachable_state_id, &discard);
         kh_value(khms_states, k) = newState;
@@ -9447,6 +9841,22 @@ int main(int argc, char** argv) {
         selected_seed = choose_seed(target_state_id, seed_selection_algo);
       }
 
+      /* Snapshot seed index for MAB reward (valid after choose_seed sets selected_seed_index) */
+      u32 mab_seed_idx = 0;
+      {
+        khint_t k_snap = kh_get(hms, khms_states, target_state_id);
+        if (k_snap != kh_end(khms_states))
+          mab_seed_idx = kh_val(khms_states, k_snap)->selected_seed_index;
+      }
+
+      /* Snapshot virgin_bits coverage count before fuzzing (for MAB reward) */
+      u32 edges_before = 0;
+      if (seed_selection_algo == EXP3 ||
+          seed_selection_algo == EXP3IX ||
+          seed_selection_algo == SLEEPING_BANDIT ||
+          seed_selection_algo == SLEEPING_BANDIT_IX)
+        edges_before = count_non_255_bytes(virgin_bits);
+
       /* Seek to the selected seed */
       if (selected_seed) {
         if (!queue_cur) {
@@ -9468,6 +9878,17 @@ int main(int argc, char** argv) {
       }
 
       skipped_fuzz = fuzz_one(use_argv);
+
+      /* MAB reward update (only for MAB algorithms) */
+      if (!skipped_fuzz &&
+          (seed_selection_algo == EXP3 ||
+           seed_selection_algo == EXP3IX ||
+           seed_selection_algo == SLEEPING_BANDIT ||
+           seed_selection_algo == SLEEPING_BANDIT_IX)) {
+        u32 edges_after = count_non_255_bytes(virgin_bits);
+        mab_update_reward(target_state_id, mab_seed_idx,
+                          seed_selection_algo, edges_before, edges_after);
+      }
 
       if (!stop_soon && sync_id && !skipped_fuzz) {
 
