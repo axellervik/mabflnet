@@ -239,6 +239,8 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 #endif /* HAVE_AFFINITY */
 
 static FILE* plot_file;               /* Gnuplot output file              */
+static FILE* mab_reward_log_f = NULL; /* Append-only MAB reward CSV       */
+static FILE* mab_seed_map_f   = NULL; /* Seed → (state, arm_idx) map CSV  */
 
 struct queue_entry {
 
@@ -890,6 +892,7 @@ void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
   }
 
   arm->pull_count++;
+  arm->cumul_reward += reward;
   arm->last_selected = state->mab_round;
   state->mab_round++;
 }
@@ -1288,6 +1291,11 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
     state->seeds[state->seeds_count] = (void *)q;
     state->seeds_count++;
 
+    if (mab_seed_map_f)
+      fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
+              state->id, state->seeds_count - 1, q->index,
+              q->generating_state_id, (u32)q->is_initial_seed);
+
     was_fuzzed_map[0][q->index] = 0; //Mark it as reachable but not fuzzed
   } else {
     PFATAL("AFLNet - the states hashtable should always contain an entry of the initial state");
@@ -1306,6 +1314,12 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
         state->seeds[state->seeds_count] = (void *)q;
         state->seeds_count++;
+
+        if (mab_seed_map_f)
+          fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
+                  state->id, state->seeds_count - 1, q->index,
+                  q->generating_state_id, (u32)q->is_initial_seed);
+
       } else {
         //XXX. This branch is supposed to be not reachable
         //However, due to some undeterminism, new state could be seen during regions' annotating process
@@ -1328,6 +1342,11 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         newState->seeds_count = 1;
         newState->mab_arms = NULL;
         newState->mab_round = 0;
+
+        if (mab_seed_map_f)
+          fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
+                  reachable_state_id, 0, q->index,
+                  q->generating_state_id, (u32)q->is_initial_seed);
 
         k = kh_put(hms, khms_states, reachable_state_id, &discard);
         kh_value(khms_states, k) = newState;
@@ -4669,6 +4688,52 @@ static void find_timeout(void) {
 
 /* Update stats file for unattended monitoring. */
 
+/* Write a snapshot of MAB per-arm state to <out_dir>/mab_stats.
+   Overwrites the file on each call (same cadence as fuzzer_stats).
+   No-op when a non-MAB seed selection algorithm is active. */
+
+static void write_mab_stats(void) {
+
+  if (seed_selection_algo != EXP3   &&
+      seed_selection_algo != EXP3IX &&
+      seed_selection_algo != SLEEPING_BANDIT &&
+      seed_selection_algo != SLEEPING_BANDIT_IX) return;
+
+  u8 *fn = alloc_printf("%s/mab_stats", out_dir);
+  s32 fd = open((char *)fn, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) PFATAL("Unable to create '%s'", fn);
+  ck_free(fn);
+
+  FILE *f = fdopen(fd, "w");
+  if (!f) PFATAL("fdopen() failed");
+
+  fprintf(f, "mab_algo          : %u\n", seed_selection_algo);
+  fprintf(f, "mab_total_rounds  : (see per-state below)\n");
+  fprintf(f, "timestamp         : %llu\n\n", get_cur_time() / 1000);
+  fprintf(f, "# state_id  arm_idx  pull_count  log_weight        "
+             "cumul_reward      last_selected\n");
+
+  khint_t k;
+  state_info_t *state;
+
+  kh_foreach_value(khms_states, state, {
+    if (!state->mab_arms) continue;
+    for (u32 i = 0; i < state->seeds_count; i++) {
+      mab_arm_t *arm = &state->mab_arms[i];
+      fprintf(f, "%-10u  %-7u  %-10u  %-16.6f  %-16.6f  %llu\n",
+              state->id, i,
+              arm->pull_count,
+              arm->log_weight,
+              arm->cumul_reward,
+              (unsigned long long)arm->last_selected);
+    }
+  });
+
+  fclose(f);
+
+}
+
+
 static void write_stats_file(double bitmap_cvg, double stability, double eps) {
 
   static double last_bcvg, last_stab, last_eps;
@@ -5277,6 +5342,7 @@ static void show_stats(void) {
 
     last_stats_ms = cur_ms;
     write_stats_file(t_byte_ratio, stab_ratio, avg_exec);
+    write_mab_stats();
     save_auto();
     write_bitmap();
 
@@ -8683,6 +8749,34 @@ EXP_ST void setup_dirs_fds(void) {
                      "unique_hangs, max_depth, execs_per_sec, n_nodes, n_edges\n");
                      /* ignore errors */
 
+  /* MAB reward log — append-only CSV, one row per MAB pull.
+     Only created when a MAB algorithm is active (-s 4..7). */
+  if (seed_selection_algo == EXP3   ||
+      seed_selection_algo == EXP3IX ||
+      seed_selection_algo == SLEEPING_BANDIT ||
+      seed_selection_algo == SLEEPING_BANDIT_IX) {
+    u8 *mab_fn = alloc_printf("%s/mab_reward_log", out_dir);
+    mab_reward_log_f = fopen((char *)mab_fn, "w");
+    if (!mab_reward_log_f) PFATAL("Unable to create '%s'", mab_fn);
+    ck_free(mab_fn);
+    fprintf(mab_reward_log_f,
+            "timestamp_ms,state_id,arm_idx,edges_before,edges_after,reward\n");
+    fflush(mab_reward_log_f);
+  }
+
+  /* MAB seed map — CSV mapping every seed's queue id to its state and arm
+     index.  Written for all algorithms so the tree visualizer works on
+     baselines too. */
+  {
+    u8 *map_fn = alloc_printf("%s/mab_seed_map", out_dir);
+    mab_seed_map_f = fopen((char *)map_fn, "w");
+    if (!mab_seed_map_f) PFATAL("Unable to create '%s'", map_fn);
+    ck_free(map_fn);
+    fprintf(mab_seed_map_f,
+            "state_id,arm_idx,queue_id,generating_state_id,is_initial\n");
+    fflush(mab_seed_map_f);
+  }
+
 }
 
 
@@ -9888,6 +9982,25 @@ int main(int argc, char** argv) {
         u32 edges_after = count_non_255_bytes(virgin_bits);
         mab_update_reward(target_state_id, mab_seed_idx,
                           seed_selection_algo, edges_before, edges_after);
+
+        /* Append one row to mab_reward_log */
+        if (mab_reward_log_f) {
+          double reward_logged = 0.0;
+          if (edges_after > edges_before)
+            reward_logged = (double)(edges_after - edges_before) / (double)MAP_SIZE;
+          if (reward_logged > 1.0) reward_logged = 1.0;
+          fprintf(mab_reward_log_f,
+                  "%llu,%u,%u,%u,%u,%.8f\n",
+                  get_cur_time(),
+                  target_state_id,
+                  mab_seed_idx,
+                  edges_before,
+                  edges_after,
+                  reward_logged);
+          /* Flush every 100 pulls to bound I/O overhead */
+          static u32 mab_log_flush_ctr = 0;
+          if (!(++mab_log_flush_ctr % 100)) fflush(mab_reward_log_f);
+        }
       }
 
       if (!stop_soon && sync_id && !skipped_fuzz) {
@@ -9978,6 +10091,7 @@ int main(int argc, char** argv) {
 
   write_bitmap();
   write_stats_file(0, 0, 0);
+  write_mab_stats();
   save_auto();
 
 stop_fuzzing:
@@ -9996,6 +10110,10 @@ stop_fuzzing:
   }
 
   fclose(plot_file);
+
+  if (mab_reward_log_f) { fflush(mab_reward_log_f); fclose(mab_reward_log_f); mab_reward_log_f = NULL; }
+  if (mab_seed_map_f)   { fflush(mab_seed_map_f);   fclose(mab_seed_map_f);   mab_seed_map_f   = NULL; }
+
   destroy_queue();
   destroy_extras();
   ck_free(target_path);

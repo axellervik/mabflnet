@@ -23,8 +23,9 @@ typedef struct {
 typedef struct {
   double  log_weight;        /* EXP3/EXP3-IX: log-space weight (initialised to 0.0 = weight 1.0) */
   u64     last_selected;     /* Sleeping Bandit: fuzzing round when this arm was last pulled */
-  u64     total_reward_bits; /* Accumulated new-bit reward (integer, scaled by 1e6) */
+  u64     total_reward_bits; /* K_active temp storage (upper 32 bits); do not use for accumulation */
   u32     pull_count;        /* Number of times this arm has been selected */
+  double  cumul_reward;      /* Accumulated reward (sum of per-pull rewards, for logging) */
 } mab_arm_t;
 
 typedef struct {
