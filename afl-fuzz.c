@@ -691,24 +691,17 @@ unsigned int choose_target_state(u8 mode) {
  * ------------------------------------------------------------------------- */
 static void mab_ensure_arms(state_info_t *state) {
   if (state->mab_arms == NULL && state->seeds_count > 0) {
-    state->mab_arms = (mab_arm_t *)ck_alloc(state->seeds_count * sizeof(mab_arm_t));
-    memset(state->mab_arms, 0, state->seeds_count * sizeof(mab_arm_t));
+    state->mab_arms = (mab_arm_t *)ck_calloc(state->seeds_count, sizeof(mab_arm_t));
+    state->mab_arms_count = state->seeds_count;
     /* log_weight = 0.0  =>  weight = exp(0) = 1.0 for all arms */
-  } else if (state->mab_arms != NULL && state->seeds_count > state->mab_round) {
+  } else if (state->mab_arms != NULL && state->seeds_count > state->mab_arms_count) {
     /* seeds_count may have grown; reallocate and zero new entries */
-    u32 old_count = 0;
-    /* count existing initialised arms by scanning for any non-zero pull */
-    for (old_count = 0; old_count < state->seeds_count; old_count++) {
-      if (state->mab_arms[old_count].pull_count == 0 &&
-          state->mab_arms[old_count].log_weight == 0.0 &&
-          old_count > 0) break;
-    }
-    if (old_count < state->seeds_count) {
-      state->mab_arms = (mab_arm_t *)ck_realloc(state->mab_arms,
-                          state->seeds_count * sizeof(mab_arm_t));
-      memset(&state->mab_arms[old_count], 0,
-             (state->seeds_count - old_count) * sizeof(mab_arm_t));
-    }
+    u32 old_count = state->mab_arms_count;
+    state->mab_arms = (mab_arm_t *)ck_realloc(state->mab_arms,
+                        state->seeds_count * sizeof(mab_arm_t));
+    memset(&state->mab_arms[old_count], 0,
+           (state->seeds_count - old_count) * sizeof(mab_arm_t));
+    state->mab_arms_count = state->seeds_count;
   }
 }
 
@@ -1199,11 +1192,12 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
           newState_From->selected_times = 0;
           newState_From->fuzzs = 0;
           newState_From->score = 1;
-          newState_From->selected_seed_index = 0;
-          newState_From->seeds = NULL;
-          newState_From->seeds_count = 0;
-          newState_From->mab_arms = NULL;
-          newState_From->mab_round = 0;
+           newState_From->selected_seed_index = 0;
+           newState_From->seeds = NULL;
+           newState_From->seeds_count = 0;
+           newState_From->mab_arms = NULL;
+           newState_From->mab_arms_count = 0;
+           newState_From->mab_round = 0;
 
           k = kh_put(hms, khms_states, prevStateID, &discard);
           kh_value(khms_states, k) = newState_From;
@@ -1230,12 +1224,13 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
           newState_To->paths_discovered = 0;
           newState_To->selected_times = 0;
           newState_To->fuzzs = 0;
-          newState_To->score = 1;
-          newState_To->selected_seed_index = 0;
-          newState_To->seeds = NULL;
-          newState_To->seeds_count = 0;
-          newState_To->mab_arms = NULL;
-          newState_To->mab_round = 0;
+           newState_To->score = 1;
+           newState_To->selected_seed_index = 0;
+           newState_To->seeds = NULL;
+           newState_To->seeds_count = 0;
+           newState_To->mab_arms = NULL;
+           newState_To->mab_arms_count = 0;
+           newState_To->mab_round = 0;
 
           k = kh_put(hms, khms_states, curStateID, &discard);
           kh_value(khms_states, k) = newState_To;
@@ -1335,13 +1330,14 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         newState->selected_times = 0;
         newState->fuzzs = 0;
         newState->score = 1;
-        newState->selected_seed_index = 0;
-        newState->seeds = NULL;
-        newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
-        newState->seeds[0] = (void *)q;
-        newState->seeds_count = 1;
-        newState->mab_arms = NULL;
-        newState->mab_round = 0;
+         newState->selected_seed_index = 0;
+         newState->seeds = NULL;
+         newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
+         newState->seeds[0] = (void *)q;
+         newState->seeds_count = 1;
+         newState->mab_arms = NULL;
+         newState->mab_arms_count = 0;
+         newState->mab_round = 0;
 
         if (mab_seed_map_f)
           fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",

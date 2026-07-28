@@ -40,6 +40,7 @@ typedef struct {
   void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
   u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
   mab_arm_t *mab_arms;        /* MAB per-arm data, length == seeds_count (NULL until first MAB call) */
+  u32 mab_arms_count;         /* Number of arms currently allocated (tracks mab_arms array size) */
   u64 mab_round;              /* Number of MAB pulls performed for this state so far */
 } state_info_t;
 
