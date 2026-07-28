@@ -691,7 +691,8 @@ unsigned int choose_target_state(u8 mode) {
  * ------------------------------------------------------------------------- */
 static void mab_ensure_arms(state_info_t *state) {
   if (state->mab_arms == NULL && state->seeds_count > 0) {
-    state->mab_arms = (mab_arm_t *)ck_calloc(state->seeds_count, sizeof(mab_arm_t));
+    state->mab_arms = (mab_arm_t *)ck_alloc(state->seeds_count * sizeof(mab_arm_t));
+    memset(state->mab_arms, 0, state->seeds_count * sizeof(mab_arm_t));
     state->mab_arms_count = state->seeds_count;
     /* log_weight = 0.0  =>  weight = exp(0) = 1.0 for all arms */
   } else if (state->mab_arms != NULL && state->seeds_count > state->mab_arms_count) {
