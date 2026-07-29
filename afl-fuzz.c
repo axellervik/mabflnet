@@ -724,7 +724,7 @@ void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
   state_info_t *state = kh_val(khms_states, k);
 
   mab_ensure_arms(state);
-  if (!state->mab_arms || seed_index >= state->seeds_count) return;
+  if (!state->mab_arms || seed_index >= state->mab_arms_count) return;
 
   mab_arm_t *arm = &state->mab_arms[seed_index];
 
@@ -4715,7 +4715,7 @@ static void write_mab_stats(void) {
 
   kh_foreach_value(khms_states, state, {
     if (!state->mab_arms) continue;
-    for (u32 i = 0; i < state->seeds_count; i++) {
+    for (u32 i = 0; i < state->mab_arms_count; i++) {
       mab_arm_t *arm = &state->mab_arms[i];
       fprintf(f, "%-10u  %-7u  %-10u  %-16.6f  %-16.6f  %llu\n",
               state->id, i,
