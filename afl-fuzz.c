@@ -1280,17 +1280,33 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
   //Update the states hashtable to keep the list of seeds which help us to reach a specific state
   //Iterate over the regions & their annotated state (sub)sequences and update the hashtable accordingly
   //All seed should "reach" state 0 (initial state) so we add this one to the map first
-  k = kh_get(hms, khms_states, 0);
-  if (k != kh_end(khms_states)) {
-    state = kh_val(khms_states, k);
-    state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
-    state->seeds[state->seeds_count] = (void *)q;
-    state->seeds_count++;
+   k = kh_get(hms, khms_states, 0);
+   if (k != kh_end(khms_states)) {
+     state = kh_val(khms_states, k);
+     state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
+     state->seeds[state->seeds_count] = (void *)q;
+     state->seeds_count++;
 
-    if (mab_seed_map_f)
-      fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
-              state->id, state->seeds_count - 1, q->index,
-              q->generating_state_id, (u32)q->is_initial_seed);
+     /* Layer 2B fix: Synchronously allocate/reallocate arms to match seeds */
+     if (state->mab_arms == NULL && state->seeds_count > 0) {
+       state->mab_arms = (mab_arm_t *)ck_alloc(state->seeds_count * sizeof(mab_arm_t));
+       memset(state->mab_arms, 0, state->seeds_count * sizeof(mab_arm_t));
+       state->mab_arms_count = state->seeds_count;
+     } else if (state->mab_arms != NULL && state->seeds_count > state->mab_arms_count) {
+       u32 old_count = state->mab_arms_count;
+       state->mab_arms = (mab_arm_t *)ck_realloc(state->mab_arms,
+                           state->seeds_count * sizeof(mab_arm_t));
+       memset(&state->mab_arms[old_count], 0,
+              (state->seeds_count - old_count) * sizeof(mab_arm_t));
+       state->mab_arms_count = state->seeds_count;
+     }
+
+     u32 arm_index = state->seeds_count - 1;
+
+     if (mab_seed_map_f)
+       fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
+               state->id, arm_index, q->index,
+               q->generating_state_id, (u32)q->is_initial_seed);
 
     was_fuzzed_map[0][q->index] = 0; //Mark it as reachable but not fuzzed
   } else {
@@ -1304,17 +1320,33 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
       //reachable_state_id is the last ID in the state_sequence
       unsigned int reachable_state_id = q->regions[i].state_sequence[regional_state_count - 1];
 
-      k = kh_get(hms, khms_states, reachable_state_id);
-      if (k != kh_end(khms_states)) {
-        state = kh_val(khms_states, k);
-        state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
-        state->seeds[state->seeds_count] = (void *)q;
-        state->seeds_count++;
+       k = kh_get(hms, khms_states, reachable_state_id);
+       if (k != kh_end(khms_states)) {
+         state = kh_val(khms_states, k);
+         state->seeds = (void **) ck_realloc (state->seeds, (state->seeds_count + 1) * sizeof(void *));
+         state->seeds[state->seeds_count] = (void *)q;
+         state->seeds_count++;
 
-        if (mab_seed_map_f)
-          fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
-                  state->id, state->seeds_count - 1, q->index,
-                  q->generating_state_id, (u32)q->is_initial_seed);
+         /* Layer 2B fix: Synchronously allocate/reallocate arms to match seeds */
+         if (state->mab_arms == NULL && state->seeds_count > 0) {
+           state->mab_arms = (mab_arm_t *)ck_alloc(state->seeds_count * sizeof(mab_arm_t));
+           memset(state->mab_arms, 0, state->seeds_count * sizeof(mab_arm_t));
+           state->mab_arms_count = state->seeds_count;
+         } else if (state->mab_arms != NULL && state->seeds_count > state->mab_arms_count) {
+           u32 old_count = state->mab_arms_count;
+           state->mab_arms = (mab_arm_t *)ck_realloc(state->mab_arms,
+                               state->seeds_count * sizeof(mab_arm_t));
+           memset(&state->mab_arms[old_count], 0,
+                  (state->seeds_count - old_count) * sizeof(mab_arm_t));
+           state->mab_arms_count = state->seeds_count;
+         }
+
+         u32 arm_index = state->seeds_count - 1;
+
+         if (mab_seed_map_f)
+           fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
+                   state->id, arm_index, q->index,
+                   q->generating_state_id, (u32)q->is_initial_seed);
 
       } else {
         //XXX. This branch is supposed to be not reachable
@@ -1323,27 +1355,36 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
         //To completely fix this, we should fix all causes leading to potential undeterminism
         //For now, we just add the state into the hashtable
 
-        state_info_t *newState = (state_info_t *) ck_alloc (sizeof(state_info_t));
-        newState->id = reachable_state_id;
-        newState->is_covered = 1;
-        newState->paths = 0;
-        newState->paths_discovered = 0;
-        newState->selected_times = 0;
-        newState->fuzzs = 0;
-        newState->score = 1;
-         newState->selected_seed_index = 0;
-         newState->seeds = NULL;
-         newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
-         newState->seeds[0] = (void *)q;
-         newState->seeds_count = 1;
-         newState->mab_arms = NULL;
-         newState->mab_arms_count = 0;
-         newState->mab_round = 0;
+         state_info_t *newState = (state_info_t *) ck_alloc (sizeof(state_info_t));
+         newState->id = reachable_state_id;
+         newState->is_covered = 1;
+         newState->paths = 0;
+         newState->paths_discovered = 0;
+         newState->selected_times = 0;
+         newState->fuzzs = 0;
+         newState->score = 1;
+          newState->selected_seed_index = 0;
+          newState->seeds = NULL;
+          newState->seeds = (void **) ck_realloc (newState->seeds, sizeof(void *));
+          newState->seeds[0] = (void *)q;
+          newState->seeds_count = 1;
+          newState->mab_arms = NULL;
+          newState->mab_arms_count = 0;
+          newState->mab_round = 0;
 
-        if (mab_seed_map_f)
-          fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
-                  reachable_state_id, 0, q->index,
-                  q->generating_state_id, (u32)q->is_initial_seed);
+         /* Layer 2B fix: Synchronously allocate arms when creating new state with seed */
+         if (newState->mab_arms == NULL && newState->seeds_count > 0) {
+           newState->mab_arms = (mab_arm_t *)ck_alloc(newState->seeds_count * sizeof(mab_arm_t));
+           memset(newState->mab_arms, 0, newState->seeds_count * sizeof(mab_arm_t));
+           newState->mab_arms_count = newState->seeds_count;
+         }
+
+         u32 arm_index = newState->seeds_count - 1;
+
+         if (mab_seed_map_f)
+           fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
+                   reachable_state_id, arm_index, q->index,
+                   q->generating_state_id, (u32)q->is_initial_seed);
 
         k = kh_put(hms, khms_states, reachable_state_id, &discard);
         kh_value(khms_states, k) = newState;
