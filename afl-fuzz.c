@@ -352,6 +352,7 @@ char** use_argv;  /* argument to run the target program. In vanilla AFL, this is
 static u8 run_target(char** argv, u32 timeout);
 static inline u32 UR(u32 limit);
 static inline u8 has_new_bits(u8* virgin_map);
+static u32 calculate_score(struct queue_entry* q); /* forward decl for MAB warm-start */
 
 /* AFLNet-specific variables & functions */
 
@@ -395,7 +396,11 @@ u8 corpus_read_or_sync = 0;
 u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
-u64 mab_sleep_window = 100;         /* SB-EXP3 sleep window (rounds); 0 = always awake */
+u64 mab_sleep_window = 10000;       /* SB sleep window (MAB rounds); 0 = always awake.
+                                       Default 10000 ≈ sqrt(K)×execs_per_fuzz_one. */
+u32 mab_exec_target_state_id = 0;  /* target state for per-execution MAB reward */
+u32 mab_exec_seed_idx        = 0;  /* seed arm index for per-execution MAB reward */
+u32 mab_exec_edges_before    = 0;  /* running edge count; updated each reward tick */
 u8 feedback_type = CODE_FEEDBACK;   /* Select interesting seeds based on code feedback */
 u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machine */
 u8 code_aware_schedule = 0;
@@ -728,12 +733,28 @@ static double beta_sample(double alpha, double beta_param) {
  * Called at the start of every MAB choose_seed() invocation so that arms
  * added after the first call (new seeds discovered mid-run) are handled.
  * ------------------------------------------------------------------------- */
+/* Warm-start helper: set log_weight from AFL's perf score for EXP3-family
+ * algorithms.  Only called for arms index range [from, to).
+ * UCB1 and Thompson Sampling do not use log_weight; skipped for them. */
+static void mab_warm_start_arms(state_info_t *state, u32 from, u32 to) {
+  if (seed_selection_algo != EXP3 && seed_selection_algo != EXP3IX &&
+      seed_selection_algo != SLEEPING_BANDIT &&
+      seed_selection_algo != SLEEPING_BANDIT_IX) return;
+  for (u32 _i = from; _i < to; _i++) {
+    if (state->seeds[_i]) {
+      double _score = (double)calculate_score(state->seeds[_i]);
+      state->mab_arms[_i].log_weight = log(_score / 100.0);
+    }
+  }
+}
+
 static void mab_ensure_arms(state_info_t *state) {
   if (state->mab_arms == NULL && state->seeds_count > 0) {
     state->mab_arms = (mab_arm_t *)ck_alloc(state->seeds_count * sizeof(mab_arm_t));
     memset(state->mab_arms, 0, state->seeds_count * sizeof(mab_arm_t));
     state->mab_arms_count = state->seeds_count;
-    /* log_weight = 0.0  =>  weight = exp(0) = 1.0 for all arms */
+    /* Warm-start: bias initial log_weights toward AFL-preferred seeds */
+    mab_warm_start_arms(state, 0, state->seeds_count);
   } else if (state->mab_arms != NULL && state->seeds_count > state->mab_arms_count) {
     /* seeds_count may have grown; reallocate and zero new entries */
     u32 old_count = state->mab_arms_count;
@@ -742,6 +763,8 @@ static void mab_ensure_arms(state_info_t *state) {
     memset(&state->mab_arms[old_count], 0,
            (state->seeds_count - old_count) * sizeof(mab_arm_t));
     state->mab_arms_count = state->seeds_count;
+    /* Warm-start newly added arms */
+    mab_warm_start_arms(state, old_count, state->seeds_count);
   }
 }
 
@@ -6155,6 +6178,23 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
 
+  /* Per-execution MAB reward update. Fires after every call to common_fuzz_stuff()
+   * when a MAB algorithm is active. virgin_bits has already been updated by
+   * save_if_interesting() → has_new_bits(), so count_non_255_bytes() reflects
+   * the current coverage state. */
+  if (state_aware_mode &&
+      (seed_selection_algo == EXP3   || seed_selection_algo == EXP3IX   ||
+       seed_selection_algo == SLEEPING_BANDIT ||
+       seed_selection_algo == SLEEPING_BANDIT_IX ||
+       seed_selection_algo == UCB1   ||
+       seed_selection_algo == THOMPSON_SAMPLING)) {
+    u32 _edges_now = count_non_255_bytes(virgin_bits);
+    mab_update_reward(mab_exec_target_state_id, mab_exec_seed_idx,
+                      seed_selection_algo,
+                      mab_exec_edges_before, _edges_now);
+    mab_exec_edges_before = _edges_now;
+  }
+
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
 
@@ -8754,8 +8794,11 @@ static void usage(u8* argv0) {
        "                    0=RANDOM, 1=ROUND_ROBIN, 2=FAVOR, 3=EXP3, 4=EXP3IX,\n"
        "                    5=SLEEPING_BANDIT, 6=SLEEPING_BANDIT_IX,\n"
        "                    7=FAVOR_PLUS_RANDOM, 8=UCB1, 9=THOMPSON_SAMPLING\n"
-       "  -Z rounds     - MAB sleep window for SLEEPING_BANDIT/IX (default: 100;\n"
-       "                  0 = always awake, i.e. degrade to EXP3/EXP3IX)\n"
+       "                    MAB reward updates occur per-execution;\n"
+       "                    initial arm weights are warm-started from perf score\n"
+       "  -Z rounds     - MAB sleep window in MAB-rounds (default: 10000;\n"
+       "                  at ~14000 rounds/hr this ≈ sqrt(K) × one fuzz_one() call;\n"
+       "                  0 = always awake, i.e. SB degrades to EXP3/EXP3IX)\n"
        "  -b algo       - feedback type (See aflnet.h for all available options)\n"
        "  -h algo       - seed schedule type (See aflnet.h for all available options)\n\n"
 
@@ -10123,6 +10166,11 @@ int main(int argc, char** argv) {
           seed_selection_algo == THOMPSON_SAMPLING)
         edges_before = count_non_255_bytes(virgin_bits);
 
+      /* Publish MAB context for per-execution reward ticks inside common_fuzz_stuff() */
+      mab_exec_target_state_id = target_state_id;
+      mab_exec_seed_idx        = mab_seed_idx;
+      mab_exec_edges_before    = edges_before;
+
       /* Seek to the selected seed */
       if (selected_seed) {
         if (!queue_cur) {
@@ -10145,7 +10193,9 @@ int main(int argc, char** argv) {
 
       skipped_fuzz = fuzz_one(use_argv);
 
-      /* MAB reward update (only for MAB algorithms) */
+      /* MAB summary log: one row per fuzz_one() call.
+       * Per-execution weight updates are handled inside common_fuzz_stuff();
+       * mab_update_reward() is not called here. */
       if (!skipped_fuzz &&
           (seed_selection_algo == EXP3 ||
            seed_selection_algo == EXP3IX ||
@@ -10153,12 +10203,8 @@ int main(int argc, char** argv) {
            seed_selection_algo == SLEEPING_BANDIT_IX ||
            seed_selection_algo == UCB1 ||
            seed_selection_algo == THOMPSON_SAMPLING)) {
-        u32 edges_after = count_non_255_bytes(virgin_bits);
-        mab_update_reward(target_state_id, mab_seed_idx,
-                          seed_selection_algo, edges_before, edges_after);
-
-        /* Append one row to mab_reward_log */
         if (mab_reward_log_f) {
+          u32 edges_after = count_non_255_bytes(virgin_bits);
           double reward_logged = 0.0;
           if (edges_after > edges_before)
             reward_logged = (double)(edges_after - edges_before) / (double)MAP_SIZE;
@@ -10171,7 +10217,7 @@ int main(int argc, char** argv) {
                   edges_before,
                   edges_after,
                   reward_logged);
-          /* Flush every 100 pulls to bound I/O overhead */
+          /* Flush every 100 fuzz_one() calls to bound I/O overhead */
           static u32 mab_log_flush_ctr = 0;
           if (!(++mab_log_flush_ctr % 100)) fflush(mab_reward_log_f);
         }
