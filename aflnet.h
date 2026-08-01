@@ -57,7 +57,9 @@ enum {
   /* 04 */ EXP3,
   /* 05 */ EXP3IX,
   /* 06 */ SLEEPING_BANDIT,
-  /* 07 */ SLEEPING_BANDIT_IX
+  /* 07 */ SLEEPING_BANDIT_IX,
+  /* 08 */ UCB1,
+  /* 09 */ THOMPSON_SAMPLING
 };
 
 enum {

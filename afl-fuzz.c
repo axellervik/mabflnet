@@ -395,6 +395,7 @@ u8 corpus_read_or_sync = 0;
 u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
+u64 mab_sleep_window = 100;         /* SB-EXP3 sleep window (rounds); 0 = always awake */
 u8 feedback_type = CODE_FEEDBACK;   /* Select interesting seeds based on code feedback */
 u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machine */
 u8 code_aware_schedule = 0;
@@ -685,6 +686,44 @@ unsigned int choose_target_state(u8 mode) {
 }
 
 /* -------------------------------------------------------------------------
+ * Thompson Sampling helpers: gamma and beta samplers.
+ *
+ * gamma_sample(shape): Marsaglia-Tsang squeeze algorithm.
+ *   Requires shape >= 1.0.  Uses the AFL RNG (UR()) for portability.
+ *
+ * beta_sample(alpha, beta): standard Beta via two gamma draws.
+ * ------------------------------------------------------------------------- */
+static double gamma_sample(double shape) {
+  /* Marsaglia & Tsang (2000) method. shape must be >= 1. */
+  double d, c, x, v, u;
+  d = shape - 1.0 / 3.0;
+  c = 1.0 / sqrt(9.0 * d);
+  for (;;) {
+    /* Box-Muller via rejection to get normal variate x */
+    double u1, u2;
+    do {
+      u1 = (double)(UR(0xFFFFFFFFU)) / (double)0xFFFFFFFFU;
+      u2 = (double)(UR(0xFFFFFFFFU)) / (double)0xFFFFFFFFU;
+    } while (u1 == 0.0);
+    x = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+    v = 1.0 + c * x;
+    if (v <= 0.0) continue;
+    v = v * v * v;
+    u = (double)(UR(0xFFFFFFFFU)) / (double)0xFFFFFFFFU;
+    /* Squeeze test */
+    if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
+    if (log(u) < 0.5 * x * x + d * (1.0 - v + log(v))) return d * v;
+  }
+}
+
+static double beta_sample(double alpha, double beta_param) {
+  double x = gamma_sample(alpha);
+  double y = gamma_sample(beta_param);
+  if (x + y == 0.0) return 0.5;
+  return x / (x + y);
+}
+
+/* -------------------------------------------------------------------------
  * MAB helper: initialise per-arm data for a state if not yet done.
  * Called at the start of every MAB choose_seed() invocation so that arms
  * added after the first call (new seeds discovered mid-run) are handled.
@@ -881,6 +920,16 @@ void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
       break;
     }
 
+    case UCB1:
+      /* UCB1: no per-update weight adjustment needed.
+       * pull_count and cumul_reward are updated in the post-switch block below. */
+      break;
+
+    case THOMPSON_SAMPLING:
+      /* Thompson Sampling: no per-update adjustment needed.
+       * pull_count and cumul_reward are updated in the post-switch block below. */
+      break;
+
     default:
       break;
   }
@@ -1023,8 +1072,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 
       case SLEEPING_BANDIT: {
         /* Sleeping Bandit (EXP3-S variant).
-         * An arm is "awake" if it was selected within the last SLEEP_WINDOW
-         * rounds, OR if it has never been selected (pull_count == 0).
+         * An arm is "awake" if mab_sleep_window==0 (always-awake mode), OR
+         * it has never been selected (pull_count==0), OR it was selected
+         * within the last mab_sleep_window rounds.
          * We run EXP3 restricted to the awake set.
          * If no arms are awake, all arms are treated as awake (full reset).
          *
@@ -1033,16 +1083,15 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
          */
         mab_ensure_arms(state);
 
-#define SLEEP_WINDOW 500ULL
-
         u32 K = state->seeds_count;
         u64 t = state->mab_round + 1;
 
         /* Count awake arms */
         u32 K_active = 0;
         for (u32 i = 0; i < K; i++) {
-          if (state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW)
+          if (mab_sleep_window == 0 ||
+              state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window)
             K_active++;
         }
         if (K_active == 0) K_active = K; /* all asleep → wake all */
@@ -1054,8 +1103,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         /* Sum weights over awake arms only */
         double sum_exp_w = 0.0;
         for (u32 i = 0; i < K; i++) {
-          if (state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+          if (mab_sleep_window == 0 ||
+              state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
               K_active == K)
             sum_exp_w += exp(state->mab_arms[i].log_weight);
         }
@@ -1064,8 +1114,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         double cumul = 0.0;
         u32 chosen = K - 1; /* fallback */
         for (u32 i = 0; i < K; i++) {
-          u8 awake = (state->mab_arms[i].pull_count == 0 ||
-                      (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+          u8 awake = (mab_sleep_window == 0 ||
+                      state->mab_arms[i].pull_count == 0 ||
+                      (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
                       K_active == K);
           if (!awake) continue;
           double p_i = (1.0 - gamma) * (exp(state->mab_arms[i].log_weight) / sum_exp_w)
@@ -1087,7 +1138,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 
       case SLEEPING_BANDIT_IX: {
         /* Sleeping Bandit with EXP3-IX draw: pure softmax over awake arms.
-         * Active-arm gating is identical to SLEEPING_BANDIT (SLEEP_WINDOW rounds).
+         * Active-arm gating uses mab_sleep_window (same semantics as SLEEPING_BANDIT).
          * K_active is stored in upper 32 bits of total_reward_bits for mab_update_reward(). */
         mab_ensure_arms(state);
 
@@ -1096,8 +1147,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         /* Count awake arms */
         u32 K_active = 0;
         for (u32 i = 0; i < K; i++) {
-          if (state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW)
+          if (mab_sleep_window == 0 ||
+              state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window)
             K_active++;
         }
         if (K_active == 0) K_active = K;
@@ -1105,8 +1157,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         /* Sum weights over awake arms */
         double sum_exp_w = 0.0;
         for (u32 i = 0; i < K; i++) {
-          if (state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+          if (mab_sleep_window == 0 ||
+              state->mab_arms[i].pull_count == 0 ||
+              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
               K_active == K)
             sum_exp_w += exp(state->mab_arms[i].log_weight);
         }
@@ -1116,8 +1169,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         double cumul = 0.0;
         u32 chosen = K - 1;
         for (u32 i = 0; i < K; i++) {
-          u8 awake = (state->mab_arms[i].pull_count == 0 ||
-                      (state->mab_round - state->mab_arms[i].last_selected) <= SLEEP_WINDOW ||
+          u8 awake = (mab_sleep_window == 0 ||
+                      state->mab_arms[i].pull_count == 0 ||
+                      (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
                       K_active == K);
           if (!awake) continue;
           double p_i = exp(state->mab_arms[i].log_weight) / sum_exp_w;
@@ -1130,6 +1184,69 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         state->mab_arms[chosen].total_reward_bits =
             (state->mab_arms[chosen].total_reward_bits & 0xFFFFFFFFULL) |
             ((u64)K_active << 32);
+
+        state->selected_seed_index = chosen;
+        result = state->seeds[chosen];
+        break;
+      }
+
+      case UCB1: {
+        /* UCB1: select arm maximising mean_reward + sqrt(2 * ln(t) / n_i).
+         * Arms with pull_count == 0 are always chosen first (infinite UCB score).
+         * t = total rounds for this state (state->mab_round + 1). */
+        mab_ensure_arms(state);
+
+        u32 K = state->seeds_count;
+        u64 t = state->mab_round + 1;
+        double ln_t = log((double)t);
+
+        u32 chosen = 0;
+        double best_score = -1.0;
+
+        for (u32 i = 0; i < K; i++) {
+          double score;
+          if (state->mab_arms[i].pull_count == 0) {
+            score = 1e300; /* infinite — always pull unvisited arm first */
+          } else {
+            double mean = state->mab_arms[i].cumul_reward /
+                          (double)state->mab_arms[i].pull_count;
+            double bonus = sqrt(2.0 * ln_t / (double)state->mab_arms[i].pull_count);
+            score = mean + bonus;
+          }
+          if (score > best_score) {
+            best_score = score;
+            chosen = i;
+          }
+        }
+
+        state->selected_seed_index = chosen;
+        result = state->seeds[chosen];
+        break;
+      }
+
+      case THOMPSON_SAMPLING: {
+        /* Thompson Sampling with Beta(alpha, beta) posteriors.
+         * alpha = cumul_reward + 1.0
+         * beta  = pull_count - cumul_reward + 1.0
+         * Sample theta_i ~ Beta(alpha_i, beta_i); choose arm with highest sample.
+         * Arms with pull_count == 0 use Beta(1,1) = Uniform(0,1). */
+        mab_ensure_arms(state);
+
+        u32 K = state->seeds_count;
+        u32 chosen = 0;
+        double best_sample = -1.0;
+
+        for (u32 i = 0; i < K; i++) {
+          double alpha = state->mab_arms[i].cumul_reward + 1.0;
+          double beta_v = (double)state->mab_arms[i].pull_count
+                          - state->mab_arms[i].cumul_reward + 1.0;
+          if (beta_v < 1.0) beta_v = 1.0; /* guard against negative rewards */
+          double theta = beta_sample(alpha, beta_v);
+          if (theta > best_sample) {
+            best_sample = theta;
+            chosen = i;
+          }
+        }
 
         state->selected_seed_index = chosen;
         result = state->seeds[chosen];
@@ -4735,7 +4852,9 @@ static void write_mab_stats(void) {
   if (seed_selection_algo != EXP3   &&
       seed_selection_algo != EXP3IX &&
       seed_selection_algo != SLEEPING_BANDIT &&
-      seed_selection_algo != SLEEPING_BANDIT_IX) return;
+      seed_selection_algo != SLEEPING_BANDIT_IX &&
+      seed_selection_algo != UCB1 &&
+      seed_selection_algo != THOMPSON_SAMPLING) return;
 
   u8 *fn = alloc_printf("%s/mab_stats", out_dir);
   s32 fd = open((char *)fn, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -4746,6 +4865,7 @@ static void write_mab_stats(void) {
   if (!f) PFATAL("fdopen() failed");
 
   fprintf(f, "mab_algo          : %u\n", seed_selection_algo);
+  fprintf(f, "mab_sleep_window  : %llu\n", (unsigned long long)mab_sleep_window);
   fprintf(f, "mab_total_rounds  : (see per-state below)\n");
   fprintf(f, "timestamp         : %llu\n\n", get_cur_time() / 1000);
   fprintf(f, "# state_id  arm_idx  pull_count  log_weight        "
@@ -8630,7 +8750,12 @@ static void usage(u8* argv0) {
        "  -F            - enable false negative reduction mode (see README.md)\n"
        "  -c cleanup    - name or full path to the server cleanup script (see README.md)\n"
        "  -q algo       - state selection algorithm (See aflnet.h for all available options)\n"
-       "  -s algo       - seed selection algorithm (See aflnet.h for all available options)\n"
+       "  -s algo       - seed selection algorithm:\n"
+       "                    0=RANDOM, 1=ROUND_ROBIN, 2=FAVOR, 3=EXP3, 4=EXP3IX,\n"
+       "                    5=SLEEPING_BANDIT, 6=SLEEPING_BANDIT_IX,\n"
+       "                    7=FAVOR_PLUS_RANDOM, 8=UCB1, 9=THOMPSON_SAMPLING\n"
+       "  -Z rounds     - MAB sleep window for SLEEPING_BANDIT/IX (default: 100;\n"
+       "                  0 = always awake, i.e. degrade to EXP3/EXP3IX)\n"
        "  -b algo       - feedback type (See aflnet.h for all available options)\n"
        "  -h algo       - seed schedule type (See aflnet.h for all available options)\n\n"
 
@@ -8788,11 +8913,13 @@ EXP_ST void setup_dirs_fds(void) {
                      /* ignore errors */
 
   /* MAB reward log — append-only CSV, one row per MAB pull.
-     Only created when a MAB algorithm is active (-s 4..7). */
+     Only created when a MAB algorithm is active (-s 3..9). */
   if (seed_selection_algo == EXP3   ||
       seed_selection_algo == EXP3IX ||
       seed_selection_algo == SLEEPING_BANDIT ||
-      seed_selection_algo == SLEEPING_BANDIT_IX) {
+      seed_selection_algo == SLEEPING_BANDIT_IX ||
+      seed_selection_algo == UCB1 ||
+      seed_selection_algo == THOMPSON_SAMPLING) {
     u8 *mab_fn = alloc_printf("%s/mab_reward_log", out_dir);
     mab_reward_log_f = fopen((char *)mab_fn, "w");
     if (!mab_reward_log_f) PFATAL("Unable to create '%s'", mab_fn);
@@ -9385,7 +9512,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:Z:")) > 0)
 
     switch (opt) {
 
@@ -9700,6 +9827,11 @@ int main(int argc, char** argv) {
 	      if (local_port < 1024 || local_port > 65535) FATAL("Invalid source port number");
         break;
 
+      case 'Z': /* MAB sleep window (rounds) */
+        if (sscanf(optarg, "%llu", &mab_sleep_window) < 1 || optarg[0] == '-')
+          FATAL("Bad syntax used for -Z; expected a non-negative integer");
+        break;
+
       default:
 
         usage(argv[0]);
@@ -9986,7 +10118,9 @@ int main(int argc, char** argv) {
       if (seed_selection_algo == EXP3 ||
           seed_selection_algo == EXP3IX ||
           seed_selection_algo == SLEEPING_BANDIT ||
-          seed_selection_algo == SLEEPING_BANDIT_IX)
+          seed_selection_algo == SLEEPING_BANDIT_IX ||
+          seed_selection_algo == UCB1 ||
+          seed_selection_algo == THOMPSON_SAMPLING)
         edges_before = count_non_255_bytes(virgin_bits);
 
       /* Seek to the selected seed */
@@ -10016,7 +10150,9 @@ int main(int argc, char** argv) {
           (seed_selection_algo == EXP3 ||
            seed_selection_algo == EXP3IX ||
            seed_selection_algo == SLEEPING_BANDIT ||
-           seed_selection_algo == SLEEPING_BANDIT_IX)) {
+           seed_selection_algo == SLEEPING_BANDIT_IX ||
+           seed_selection_algo == UCB1 ||
+           seed_selection_algo == THOMPSON_SAMPLING)) {
         u32 edges_after = count_non_255_bytes(virgin_bits);
         mab_update_reward(target_state_id, mab_seed_idx,
                           seed_selection_algo, edges_before, edges_after);
