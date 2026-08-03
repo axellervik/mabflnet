@@ -42,6 +42,7 @@ typedef struct {
   mab_arm_t *mab_arms;        /* MAB per-arm data, length == seeds_count (NULL until first MAB call) */
   u32 mab_arms_count;         /* Number of arms currently allocated (tracks mab_arms array size) */
   u64 mab_round;              /* Number of MAB pulls performed for this state so far */
+  u32 mab_last_K_active;      /* SB: K_active at most recent choose_seed() call (for logging) */
 } state_info_t;
 
 enum {

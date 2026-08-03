@@ -396,11 +396,18 @@ u8 corpus_read_or_sync = 0;
 u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
-u64 mab_sleep_window = 10000;       /* SB sleep window (MAB rounds); 0 = always awake.
-                                       Default 10000 ≈ sqrt(K)×execs_per_fuzz_one. */
+u64 mab_sleep_window = 500;         /* SB sleep window (MAB rounds); 0 = always awake.
+                                       Default 500 ≈ 2× K, keeps ~sqrt(K) arms awake
+                                       at ~8k rounds/hr.  Override with -Z <rounds>. */
 u32 mab_exec_target_state_id = 0;  /* target state for per-execution MAB reward */
 u32 mab_exec_seed_idx        = 0;  /* seed arm index for per-execution MAB reward */
 u32 mab_exec_edges_before    = 0;  /* running edge count; updated each reward tick */
+u32 mab_exec_paths_before    = 0;  /* queued_discovered snapshot; for path-bonus reward */
+
+/* Reward bonus per new path found during an execution.
+ * ~3× the typical 2-edge reward (2/65536 ≈ 3e-5), giving the MAB a
+ * meaningful signal even after the global edge frontier is exhausted. */
+#define PATH_REWARD_WEIGHT 0.0001
 u8 feedback_type = CODE_FEEDBACK;   /* Select interesting seeds based on code feedback */
 u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machine */
 u8 code_aware_schedule = 0;
@@ -780,7 +787,7 @@ static void mab_ensure_arms(state_info_t *state) {
  * count and passes it here).
  * ------------------------------------------------------------------------- */
 void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
-                       u32 edges_before, u32 edges_after) {
+                       u32 edges_before, u32 edges_after, u32 new_paths) {
   khint_t k = kh_get(hms, khms_states, target_state_id);
   if (k == kh_end(khms_states)) return;
   state_info_t *state = kh_val(khms_states, k);
@@ -790,12 +797,16 @@ void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
 
   mab_arm_t *arm = &state->mab_arms[seed_index];
 
-  /* reward in [0,1]: fraction of new edges found this round */
+  /* reward in [0,1]: fraction of new edges found this round,
+   * plus a fixed bonus per new path discovered (path-discovery signal).
+   * The path bonus keeps the MAB learning after the global edge frontier
+   * is exhausted — paths continue growing even when no new edges are found. */
   double reward = 0.0;
-  if (edges_after > edges_before) {
+  if (edges_after > edges_before)
     reward = (double)(edges_after - edges_before) / (double)MAP_SIZE;
-    if (reward > 1.0) reward = 1.0;
-  }
+  if (new_paths > 0)
+    reward += (double)new_paths * PATH_REWARD_WEIGHT;
+  if (reward > 1.0) reward = 1.0;
 
   u32 K = state->seeds_count;
   u64 t = state->mab_round; /* round index before this pull (>=1 after first pull) */
@@ -1118,6 +1129,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
             K_active++;
         }
         if (K_active == 0) K_active = K; /* all asleep → wake all */
+        state->mab_last_K_active = K_active; /* record for mab_stats logging */
 
         double gamma = sqrt((double)K_active * log((double)(K_active + 1)) /
                             ((M_E - 1.0) * (double)t));
@@ -1176,6 +1188,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
             K_active++;
         }
         if (K_active == 0) K_active = K;
+        state->mab_last_K_active = K_active; /* record for mab_stats logging */
 
         /* Sum weights over awake arms */
         double sum_exp_w = 0.0;
@@ -4887,8 +4900,17 @@ static void write_mab_stats(void) {
   FILE *f = fdopen(fd, "w");
   if (!f) PFATAL("fdopen() failed");
 
+  /* Find state 0's last K_active for the header (best proxy for SB behaviour) */
+  u32 _k_active_s0 = 0;
+  {
+    khint_t _ks0 = kh_get(hms, khms_states, 0);
+    if (_ks0 != kh_end(khms_states))
+      _k_active_s0 = kh_val(khms_states, _ks0)->mab_last_K_active;
+  }
+
   fprintf(f, "mab_algo          : %u\n", seed_selection_algo);
   fprintf(f, "mab_sleep_window  : %llu\n", (unsigned long long)mab_sleep_window);
+  fprintf(f, "mab_K_active_s0   : %u\n", _k_active_s0);
   fprintf(f, "mab_total_rounds  : (see per-state below)\n");
   fprintf(f, "timestamp         : %llu\n\n", get_cur_time() / 1000);
   fprintf(f, "# state_id  arm_idx  pull_count  log_weight        "
@@ -6181,7 +6203,9 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   /* Per-execution MAB reward update. Fires after every call to common_fuzz_stuff()
    * when a MAB algorithm is active. virgin_bits has already been updated by
    * save_if_interesting() → has_new_bits(), so count_non_255_bytes() reflects
-   * the current coverage state. */
+   * the current coverage state.  queued_discovered has already been incremented
+   * by save_if_interesting() if a new path was found, so the delta gives the
+   * number of new paths found during this single execution. */
   if (state_aware_mode &&
       (seed_selection_algo == EXP3   || seed_selection_algo == EXP3IX   ||
        seed_selection_algo == SLEEPING_BANDIT ||
@@ -6189,10 +6213,13 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
        seed_selection_algo == UCB1   ||
        seed_selection_algo == THOMPSON_SAMPLING)) {
     u32 _edges_now = count_non_255_bytes(virgin_bits);
+    u32 _new_paths = (queued_discovered > mab_exec_paths_before)
+                     ? (queued_discovered - mab_exec_paths_before) : 0;
     mab_update_reward(mab_exec_target_state_id, mab_exec_seed_idx,
                       seed_selection_algo,
-                      mab_exec_edges_before, _edges_now);
+                      mab_exec_edges_before, _edges_now, _new_paths);
     mab_exec_edges_before = _edges_now;
+    mab_exec_paths_before = queued_discovered;
   }
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
@@ -10170,6 +10197,7 @@ int main(int argc, char** argv) {
       mab_exec_target_state_id = target_state_id;
       mab_exec_seed_idx        = mab_seed_idx;
       mab_exec_edges_before    = edges_before;
+      mab_exec_paths_before    = queued_discovered;
 
       /* Seek to the selected seed */
       if (selected_seed) {
