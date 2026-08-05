@@ -396,9 +396,6 @@ u8 corpus_read_or_sync = 0;
 u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
-u64 mab_sleep_window = 500;         /* SB sleep window (MAB rounds); 0 = always awake.
-                                       Default 500 ≈ 2× K, keeps ~sqrt(K) arms awake
-                                       at ~8k rounds/hr.  Override with -Z <rounds>. */
 u32 mab_exec_target_state_id = 0;  /* target state for per-execution MAB reward */
 u32 mab_exec_seed_idx        = 0;  /* seed arm index for per-execution MAB reward */
 u32 mab_exec_edges_before    = 0;  /* running edge count; updated each reward tick */
@@ -1106,11 +1103,20 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 
       case SLEEPING_BANDIT: {
         /* Sleeping Bandit (EXP3-S variant).
-         * An arm is "awake" if mab_sleep_window==0 (always-awake mode), OR
-         * it has never been selected (pull_count==0), OR it was selected
-         * within the last mab_sleep_window rounds.
-         * We run EXP3 restricted to the awake set.
-         * If no arms are awake, all arms are treated as awake (full reset).
+         *
+         * "Asleep" is defined using AFLNet's own exhaustion bookkeeping: a
+         * seed goes to sleep once AFLNet's global bitmap-competition
+         * (cull_queue()/update_bitmap_score()) has already marked it
+         * fuzzed-and-non-favored, and at least one full queue cycle has
+         * elapsed since the run started. This is an exogenous signal
+         * (computed independently of the MAB's own draw history), matching
+         * the sleeping-bandit literature (Kleinberg 2010, Saha 2020, Nguyen
+         * 2024) and avoids a "never pulled == always awake" dilution trap: a
+         * brand-new seed has was_fuzzed==0, so it is always awake by
+         * construction until AFLNet itself decides it is redundant.
+         *
+         * We run EXP3 restricted to the awake set. If no arms are awake, all arms
+         * are treated as awake (full reset) — same fallback as before.
          *
          * K_active is stored temporarily in the upper 32 bits of
          * arm->total_reward_bits so mab_update_reward() can retrieve it.
@@ -1120,13 +1126,12 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         u32 K = state->seeds_count;
         u64 t = state->mab_round + 1;
 
-        /* Count awake arms */
+        /* Count awake arms using the AFLNet exhaustion signal */
         u32 K_active = 0;
         for (u32 i = 0; i < K; i++) {
-          if (mab_sleep_window == 0 ||
-              state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window)
-            K_active++;
+          struct queue_entry *seed_i = state->seeds[i];
+          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          if (!asleep) K_active++;
         }
         if (K_active == 0) K_active = K; /* all asleep → wake all */
         state->mab_last_K_active = K_active; /* record for mab_stats logging */
@@ -1138,10 +1143,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         /* Sum weights over awake arms only */
         double sum_exp_w = 0.0;
         for (u32 i = 0; i < K; i++) {
-          if (mab_sleep_window == 0 ||
-              state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
-              K_active == K)
+          struct queue_entry *seed_i = state->seeds[i];
+          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          if (!asleep || K_active == K)
             sum_exp_w += exp(state->mab_arms[i].log_weight);
         }
 
@@ -1149,10 +1153,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         double cumul = 0.0;
         u32 chosen = K - 1; /* fallback */
         for (u32 i = 0; i < K; i++) {
-          u8 awake = (mab_sleep_window == 0 ||
-                      state->mab_arms[i].pull_count == 0 ||
-                      (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
-                      K_active == K);
+          struct queue_entry *seed_i = state->seeds[i];
+          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 awake = !asleep || (K_active == K);
           if (!awake) continue;
           double p_i = (1.0 - gamma) * (exp(state->mab_arms[i].log_weight) / sum_exp_w)
                        + gamma / (double)K_active;
@@ -1173,8 +1176,10 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 
       case SLEEPING_BANDIT_IX: {
         /* Sleeping Bandit with EXP3-IX draw: pure softmax over awake arms.
-         * Active-arm gating uses mab_sleep_window (same semantics as SLEEPING_BANDIT).
-         * K_active is stored in upper 32 bits of total_reward_bits for mab_update_reward(). */
+         * Awake predicate: see SLEEPING_BANDIT above (AFLNet exhaustion
+         * signal, not MAB recency window).
+         * K_active is stored in upper 32 bits of total_reward_bits for
+         * mab_update_reward(). */
         mab_ensure_arms(state);
 
         u32 K = state->seeds_count;
@@ -1182,10 +1187,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         /* Count awake arms */
         u32 K_active = 0;
         for (u32 i = 0; i < K; i++) {
-          if (mab_sleep_window == 0 ||
-              state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window)
-            K_active++;
+          struct queue_entry *seed_i = state->seeds[i];
+          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          if (!asleep) K_active++;
         }
         if (K_active == 0) K_active = K;
         state->mab_last_K_active = K_active; /* record for mab_stats logging */
@@ -1193,10 +1197,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         /* Sum weights over awake arms */
         double sum_exp_w = 0.0;
         for (u32 i = 0; i < K; i++) {
-          if (mab_sleep_window == 0 ||
-              state->mab_arms[i].pull_count == 0 ||
-              (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
-              K_active == K)
+          struct queue_entry *seed_i = state->seeds[i];
+          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          if (!asleep || K_active == K)
             sum_exp_w += exp(state->mab_arms[i].log_weight);
         }
 
@@ -1205,10 +1208,9 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         double cumul = 0.0;
         u32 chosen = K - 1;
         for (u32 i = 0; i < K; i++) {
-          u8 awake = (mab_sleep_window == 0 ||
-                      state->mab_arms[i].pull_count == 0 ||
-                      (state->mab_round - state->mab_arms[i].last_selected) <= mab_sleep_window ||
-                      K_active == K);
+          struct queue_entry *seed_i = state->seeds[i];
+          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 awake = !asleep || (K_active == K);
           if (!awake) continue;
           double p_i = exp(state->mab_arms[i].log_weight) / sum_exp_w;
           cumul += p_i;
@@ -4909,8 +4911,8 @@ static void write_mab_stats(void) {
   }
 
   fprintf(f, "mab_algo          : %u\n", seed_selection_algo);
-  fprintf(f, "mab_sleep_window  : %llu\n", (unsigned long long)mab_sleep_window);
   fprintf(f, "mab_K_active_s0   : %u\n", _k_active_s0);
+  fprintf(f, "mab_sleep_design  : exhaustion_signal\n");
   fprintf(f, "mab_total_rounds  : (see per-state below)\n");
   fprintf(f, "timestamp         : %llu\n\n", get_cur_time() / 1000);
   fprintf(f, "# state_id  arm_idx  pull_count  log_weight        "
@@ -8822,10 +8824,9 @@ static void usage(u8* argv0) {
        "                    5=SLEEPING_BANDIT, 6=SLEEPING_BANDIT_IX,\n"
        "                    7=FAVOR_PLUS_RANDOM, 8=UCB1, 9=THOMPSON_SAMPLING\n"
        "                    MAB reward updates occur per-execution;\n"
-       "                    initial arm weights are warm-started from perf score\n"
-       "  -Z rounds     - MAB sleep window in MAB-rounds (default: 10000;\n"
-       "                  at ~14000 rounds/hr this ≈ sqrt(K) × one fuzz_one() call;\n"
-       "                  0 = always awake, i.e. SB degrades to EXP3/EXP3IX)\n"
+       "                    initial arm weights are warm-started from perf score;\n"
+       "                    SLEEPING_BANDIT/_IX use AFLNet's own was_fuzzed/\n"
+       "                    favored/queue_cycle bookkeeping to determine sleep\n"
        "  -b algo       - feedback type (See aflnet.h for all available options)\n"
        "  -h algo       - seed schedule type (See aflnet.h for all available options)\n\n"
 
@@ -9582,7 +9583,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:Z:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:")) > 0)
 
     switch (opt) {
 
@@ -9895,11 +9896,6 @@ int main(int argc, char** argv) {
         if (local_port) FATAL("Multiple -l options not supported");
         local_port = atoi(optarg);
 	      if (local_port < 1024 || local_port > 65535) FATAL("Invalid source port number");
-        break;
-
-      case 'Z': /* MAB sleep window (rounds) */
-        if (sscanf(optarg, "%llu", &mab_sleep_window) < 1 || optarg[0] == '-')
-          FATAL("Bad syntax used for -Z; expected a non-negative integer");
         break;
 
       default:
