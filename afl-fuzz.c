@@ -396,12 +396,8 @@ u8 corpus_read_or_sync = 0;
 u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
-u32 mab_exec_target_state_id = 0;  /* target state for per-execution MAB reward */
-u32 mab_exec_seed_idx        = 0;  /* seed arm index for per-execution MAB reward */
-u32 mab_exec_edges_before    = 0;  /* running edge count; updated each reward tick */
-u32 mab_exec_paths_before    = 0;  /* queued_discovered snapshot; for path-bonus reward */
 
-/* Reward bonus per new path found during an execution.
+/* Reward bonus per new path found while fuzzing a seed.
  * ~3× the typical 2-edge reward (2/65536 ≈ 3e-5), giving the MAB a
  * meaningful signal even after the global edge frontier is exhausted. */
 #define PATH_REWARD_WEIGHT 0.0001
@@ -6202,27 +6198,10 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
 
-  /* Per-execution MAB reward update. Fires after every call to common_fuzz_stuff()
-   * when a MAB algorithm is active. virgin_bits has already been updated by
-   * save_if_interesting() → has_new_bits(), so count_non_255_bytes() reflects
-   * the current coverage state.  queued_discovered has already been incremented
-   * by save_if_interesting() if a new path was found, so the delta gives the
-   * number of new paths found during this single execution. */
-  if (state_aware_mode &&
-      (seed_selection_algo == EXP3   || seed_selection_algo == EXP3IX   ||
-       seed_selection_algo == SLEEPING_BANDIT ||
-       seed_selection_algo == SLEEPING_BANDIT_IX ||
-       seed_selection_algo == UCB1   ||
-       seed_selection_algo == THOMPSON_SAMPLING)) {
-    u32 _edges_now = count_non_255_bytes(virgin_bits);
-    u32 _new_paths = (queued_discovered > mab_exec_paths_before)
-                     ? (queued_discovered - mab_exec_paths_before) : 0;
-    mab_update_reward(mab_exec_target_state_id, mab_exec_seed_idx,
-                      seed_selection_algo,
-                      mab_exec_edges_before, _edges_now, _new_paths);
-    mab_exec_edges_before = _edges_now;
-    mab_exec_paths_before = queued_discovered;
-  }
+  /* MAB reward bookkeeping happens once per fuzz_one() call (see the main
+   * loop in main()), not per execution: the arm being scored is "the seed
+   * that was fuzzed", and its reward reflects the net coverage/path gain
+   * over the entire fuzz_one() call, not any single mutation within it. */
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
@@ -10179,8 +10158,10 @@ int main(int argc, char** argv) {
           mab_seed_idx = kh_val(khms_states, k_snap)->selected_seed_index;
       }
 
-      /* Snapshot virgin_bits coverage count before fuzzing (for MAB reward) */
+      /* Snapshot coverage/paths before fuzzing this seed (for MAB reward,
+       * computed once the whole fuzz_one() call below has completed) */
       u32 edges_before = 0;
+      u32 paths_before = queued_discovered;
       if (seed_selection_algo == EXP3 ||
           seed_selection_algo == EXP3IX ||
           seed_selection_algo == SLEEPING_BANDIT ||
@@ -10188,12 +10169,6 @@ int main(int argc, char** argv) {
           seed_selection_algo == UCB1 ||
           seed_selection_algo == THOMPSON_SAMPLING)
         edges_before = count_non_255_bytes(virgin_bits);
-
-      /* Publish MAB context for per-execution reward ticks inside common_fuzz_stuff() */
-      mab_exec_target_state_id = target_state_id;
-      mab_exec_seed_idx        = mab_seed_idx;
-      mab_exec_edges_before    = edges_before;
-      mab_exec_paths_before    = queued_discovered;
 
       /* Seek to the selected seed */
       if (selected_seed) {
@@ -10217,9 +10192,13 @@ int main(int argc, char** argv) {
 
       skipped_fuzz = fuzz_one(use_argv);
 
-      /* MAB summary log: one row per fuzz_one() call.
-       * Per-execution weight updates are handled inside common_fuzz_stuff();
-       * mab_update_reward() is not called here. */
+      /* MAB reward update: one pull per fuzz_one() call. The arm that was
+       * drawn by choose_seed() above is scored on the net coverage/path
+       * gain accumulated over the entire fuzz_one() call (all deterministic
+       * and havoc stages combined), not on any single mutation within it.
+       * This keeps one MAB "round" aligned with one seed-selection decision,
+       * and keeps mab_reward_log's rows and mab_stats' pull_count in sync,
+       * since both are derived from the same before/after snapshot here. */
       if (!skipped_fuzz &&
           (seed_selection_algo == EXP3 ||
            seed_selection_algo == EXP3IX ||
@@ -10227,11 +10206,20 @@ int main(int argc, char** argv) {
            seed_selection_algo == SLEEPING_BANDIT_IX ||
            seed_selection_algo == UCB1 ||
            seed_selection_algo == THOMPSON_SAMPLING)) {
+        u32 edges_after = count_non_255_bytes(virgin_bits);
+        u32 paths_after = queued_discovered;
+        u32 new_paths = (paths_after > paths_before)
+                        ? (paths_after - paths_before) : 0;
+
+        mab_update_reward(target_state_id, mab_seed_idx, seed_selection_algo,
+                          edges_before, edges_after, new_paths);
+
         if (mab_reward_log_f) {
-          u32 edges_after = count_non_255_bytes(virgin_bits);
           double reward_logged = 0.0;
           if (edges_after > edges_before)
             reward_logged = (double)(edges_after - edges_before) / (double)MAP_SIZE;
+          if (new_paths > 0)
+            reward_logged += (double)new_paths * PATH_REWARD_WEIGHT;
           if (reward_logged > 1.0) reward_logged = 1.0;
           fprintf(mab_reward_log_f,
                   "%llu,%u,%u,%u,%u,%.8f\n",
