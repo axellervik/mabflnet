@@ -138,6 +138,14 @@
 
 #define SPLICE_HAVOC        32
 
+/* Reduced havoc/splice budget for MAB seed-selection algorithms,
+   to raise rounds/hour. Non-MAB algorithms continue using vanilla
+   constants. Applied only for EXP3/EXP3-IX/SLEEPING_BANDIT/UCB1/THOMPSON. */
+
+#define MAB_HAVOC_CYCLES     32
+#define MAB_SPLICE_CYCLES    2
+#define MAB_HAVOC_MIN        4
+
 /* Maximum offset for integer addition / subtraction stages: */
 
 #define ARITH_MAX           35

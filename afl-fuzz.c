@@ -397,6 +397,13 @@ u8 state_aware_mode = 0;
 u8 region_level_mutation = 0;
 u8 state_selection_algo = ROUND_ROBIN, seed_selection_algo = RANDOM_SELECTION;
 
+/* MAB-only execs/round reduction: reduced havoc/splice budget for
+   MAB algorithms. Initialized to config.h defaults; overridden in main()
+   after CLI parsing. Non-MAB algorithms use vanilla config.h constants. */
+static u32 mab_havoc_cycles   = HAVOC_CYCLES;
+static u32 mab_splice_cycles  = SPLICE_CYCLES;
+static u32 mab_havoc_min      = HAVOC_MIN;
+
 /* Reward bonus per new path found while fuzzing a seed.
  * ~3× the typical 2-edge reward (2/65536 ≈ 3e-5), giving the MAB a
  * meaningful signal even after the global edge frontier is exhausted. */
@@ -7680,7 +7687,7 @@ havoc_stage:
 
     stage_name  = "havoc";
     stage_short = "havoc";
-    stage_max   = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+    stage_max   = (doing_det ? HAVOC_CYCLES_INIT : mab_havoc_cycles) *
                   perf_score / havoc_div / 100;
 
   } else {
@@ -7696,7 +7703,7 @@ havoc_stage:
 
   }
 
-  if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
+  if (stage_max < mab_havoc_min) stage_max = mab_havoc_min;
 
   temp_len = len;
 
@@ -8216,7 +8223,7 @@ havoc_stage:
 
 retry_splicing:
 
-  if (use_splicing && splice_cycle++ < SPLICE_CYCLES &&
+  if (use_splicing && splice_cycle++ < mab_splice_cycles &&
       queued_paths > 1 && M2_len > 1) {
 
     struct queue_entry* target;
@@ -9882,6 +9889,19 @@ int main(int argc, char** argv) {
         usage(argv[0]);
 
     }
+
+  /* Override havoc budget for MAB algorithms only: EXP3, EXP3IX,
+     SLEEPING_BANDIT, SLEEPING_BANDIT_IX, UCB1, THOMPSON_SAMPLING.
+     Non-MAB algorithms continue under vanilla config.h constants. */
+  if (seed_selection_algo == EXP3 || seed_selection_algo == EXP3IX ||
+      seed_selection_algo == SLEEPING_BANDIT ||
+      seed_selection_algo == SLEEPING_BANDIT_IX ||
+      seed_selection_algo == UCB1 ||
+      seed_selection_algo == THOMPSON_SAMPLING) {
+    mab_havoc_cycles  = MAB_HAVOC_CYCLES;
+    mab_splice_cycles = MAB_SPLICE_CYCLES;
+    mab_havoc_min     = MAB_HAVOC_MIN;
+  }
 
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
