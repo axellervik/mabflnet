@@ -404,9 +404,20 @@ static u32 mab_havoc_cycles   = HAVOC_CYCLES;
 static u32 mab_splice_cycles  = SPLICE_CYCLES;
 static u32 mab_havoc_min      = HAVOC_MIN;
 
-/* Reward bonus per new path found while fuzzing a seed.
- * ~3× the typical 2-edge reward (2/65536 ≈ 3e-5), giving the MAB a
- * meaningful signal even after the global edge frontier is exhausted. */
+/* Overall reward magnitude scale. The raw reward (edge-novelty term plus
+ * path bonus, see mab_update_reward() below) is on the order of 1e-5 to
+ * 1e-4 per round, far below the [0,1] range that EXP3/UCB1/Thompson
+ * Sampling's update rules assume they are operating in. This constant
+ * multiplies the combined reward (after summing the edge and path terms,
+ * before clamping to 1.0) so a typical productive round lands well inside
+ * (0,1] instead of near 0, giving the MAB algorithms a usable magnitude of
+ * signal without changing what is being measured -- only its scale. */
+#define REWARD_SCALE 100.0
+
+/* Reward bonus per new path found while fuzzing a seed. Chosen so a single
+ * new path is worth roughly the same as a handful of new edges, keeping
+ * the path-discovery signal comparable in size to the edge-novelty term
+ * before REWARD_SCALE is applied to their sum. */
 #define PATH_REWARD_WEIGHT 0.0001
 u8 feedback_type = CODE_FEEDBACK;   /* Select interesting seeds based on code feedback */
 u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machine */
@@ -779,12 +790,17 @@ static void mab_ensure_arms(state_info_t *state) {
  * MAB reward update.  Called from the main fuzzing loop immediately after
  * fuzz_one() returns, when a MAB algorithm is active.
  *
- * reward = (new edges discovered during this fuzz_one call) / MAP_SIZE
- *          clamped to [0, 1].
+ * reward = REWARD_SCALE * [(new edges discovered during this fuzz_one
+ *          call) / MAP_SIZE, plus a per-new-path bonus], clamped to [0, 1].
  *
  * We detect "new edges" via the change in the count of non-255 bytes in
  * virgin_bits before vs. after fuzz_one (the caller snapshots the before
  * count and passes it here).
+ *
+ * Note: this does not address the separate reward-plateau problem, where
+ * rounds score exactly zero once an edge has been seen once anywhere (by
+ * any seed) and virgin_bits stops crediting it -- that requires a
+ * different fix to how novelty is measured, not just a change in scale.
  * ------------------------------------------------------------------------- */
 void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
                        u32 edges_before, u32 edges_after, u32 new_paths) {
@@ -797,15 +813,17 @@ void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
 
   mab_arm_t *arm = &state->mab_arms[seed_index];
 
-  /* reward in [0,1]: fraction of new edges found this round,
-   * plus a fixed bonus per new path discovered (path-discovery signal).
-   * The path bonus keeps the MAB learning after the global edge frontier
-   * is exhausted — paths continue growing even when no new edges are found. */
+  /* reward in [0,1]: fraction of new edges found this round, plus a fixed
+   * bonus per new path discovered (path-discovery signal), summed and then
+   * scaled up to a magnitude usable by the MAB update rules. The path
+   * bonus keeps the MAB learning after the global edge frontier is
+   * exhausted -- paths continue growing even when no new edges are found. */
   double reward = 0.0;
   if (edges_after > edges_before)
     reward = (double)(edges_after - edges_before) / (double)MAP_SIZE;
   if (new_paths > 0)
     reward += (double)new_paths * PATH_REWARD_WEIGHT;
+  reward *= REWARD_SCALE;
   if (reward > 1.0) reward = 1.0;
 
   u32 K = state->seeds_count;
@@ -4917,6 +4935,8 @@ static void write_mab_stats(void) {
   fprintf(f, "mab_K_active_s0   : %u\n", _k_active_s0);
   fprintf(f, "mab_sleep_design  : exhaustion_signal\n");
   fprintf(f, "mab_total_rounds  : (see per-state below)\n");
+  fprintf(f, "reward_scale      : %.4f\n", (double)REWARD_SCALE);
+  fprintf(f, "path_reward_weight: %.8f\n", (double)PATH_REWARD_WEIGHT);
   fprintf(f, "timestamp         : %llu\n\n", get_cur_time() / 1000);
   fprintf(f, "# state_id  arm_idx  pull_count  log_weight        "
              "cumul_reward      last_selected\n");
@@ -10235,11 +10255,16 @@ int main(int argc, char** argv) {
                           edges_before, edges_after, new_paths);
 
         if (mab_reward_log_f) {
+          /* Must stay byte-for-byte identical to the formula in
+           * mab_update_reward() above (same REWARD_SCALE,
+           * PATH_REWARD_WEIGHT) so the logged value always matches what
+           * was actually used for the weight update. */
           double reward_logged = 0.0;
           if (edges_after > edges_before)
             reward_logged = (double)(edges_after - edges_before) / (double)MAP_SIZE;
           if (new_paths > 0)
             reward_logged += (double)new_paths * PATH_REWARD_WEIGHT;
+          reward_logged *= REWARD_SCALE;
           if (reward_logged > 1.0) reward_logged = 1.0;
           fprintf(mab_reward_log_f,
                   "%llu,%u,%u,%u,%u,%.8f\n",
