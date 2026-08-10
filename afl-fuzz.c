@@ -158,6 +158,32 @@ EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
 
 static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
 
+/* Historical high-water-mark bucket per edge (0 = never seen). Reused
+ * bucket domain from count_class_lookup8: 0,1,2,4,8,16,32,64,128.
+ * Persists for the whole run, analogous to virgin_bits but tracking
+ * "how common has this edge been", not "has it been seen at all". */
+static u8  edge_rarity_bucket[MAP_SIZE];
+
+/* Per-round dedup: has this edge already been credited to the current
+ * round's rarity sum? Reset to all-zero once per round (before each
+ * fuzz_one() call), so an edge hit by 1000 executions within one round
+ * contributes exactly once -- matching virgin_bits' volume-insensitivity
+ * property. */
+static u8  credited_this_round[MAP_SIZE];
+
+/* Running total for the round currently in progress. Reset alongside
+ * credited_this_round; read (not reset) immediately after fuzz_one()
+ * returns, before the next round's reset. */
+static double mab_round_rarity_sum;
+
+/* Running count of distinct edges credited this round, for logging. */
+static u32 mab_round_edges_credited;
+
+/* Cached once after CLI parsing: true iff seed_selection_algo is one of
+ * the MAB algorithms. Avoids a multi-way enum comparison on every single
+ * execution (run_target() is the hottest function in the fuzzer). */
+static u8  mab_active;
+
 static s32 shm_id;                    /* ID of the SHM region             */
 
 static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
@@ -790,20 +816,25 @@ static void mab_ensure_arms(state_info_t *state) {
  * MAB reward update.  Called from the main fuzzing loop immediately after
  * fuzz_one() returns, when a MAB algorithm is active.
  *
- * reward = REWARD_SCALE * [(new edges discovered during this fuzz_one
- *          call) / MAP_SIZE, plus a per-new-path bonus], clamped to [0, 1].
+ * reward = REWARD_SCALE * [(rarity-weighted edge credit accumulated during
+ *          this fuzz_one call) / MAP_SIZE, plus a per-new-path bonus],
+ *          clamped to [0, 1].
  *
- * We detect "new edges" via the change in the count of non-255 bytes in
- * virgin_bits before vs. after fuzz_one (the caller snapshots the before
- * count and passes it here).
- *
- * Note: this does not address the separate reward-plateau problem, where
- * rounds score exactly zero once an edge has been seen once anywhere (by
- * any seed) and virgin_bits stops crediting it -- that requires a
- * different fix to how novelty is measured, not just a change in scale.
+ * The edge term is no longer derived from virgin_bits (a monotonically
+ * shrinking global bitmap that permanently stops crediting an edge once
+ * any seed anywhere has found it, causing many rounds to score exactly
+ * zero). Instead, the caller accumulates a rarity-weighted sum during the
+ * fuzz_one() call (see mab_accumulate_rarity_reward()): each edge touched
+ * for the first time in this round contributes 1/(1+prior_bucket), where
+ * prior_bucket is how common that edge has historically been. A
+ * brand-new edge contributes the maximum (1.0); a very common edge still
+ * contributes a small but strictly positive amount instead of nothing.
+ * This keeps the reward signal from hard-cutting to zero once the easy
+ * edges have already been found by someone. Note this is still a global
+ * (not per-state) signal, same limitation virgin_bits had.
  * ------------------------------------------------------------------------- */
 void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
-                       u32 edges_before, u32 edges_after, u32 new_paths) {
+                       double rarity_reward_raw, u32 new_paths) {
   khint_t k = kh_get(hms, khms_states, target_state_id);
   if (k == kh_end(khms_states)) return;
   state_info_t *state = kh_val(khms_states, k);
@@ -813,14 +844,12 @@ void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
 
   mab_arm_t *arm = &state->mab_arms[seed_index];
 
-  /* reward in [0,1]: fraction of new edges found this round, plus a fixed
-   * bonus per new path discovered (path-discovery signal), summed and then
-   * scaled up to a magnitude usable by the MAB update rules. The path
-   * bonus keeps the MAB learning after the global edge frontier is
+  /* reward in [0,1]: rarity-weighted edge credit for this round, plus a
+   * fixed bonus per new path discovered (path-discovery signal), summed
+   * and then scaled up to a magnitude usable by the MAB update rules. The
+   * path bonus keeps the MAB learning after the global edge frontier is
    * exhausted -- paths continue growing even when no new edges are found. */
-  double reward = 0.0;
-  if (edges_after > edges_before)
-    reward = (double)(edges_after - edges_before) / (double)MAP_SIZE;
+  double reward = rarity_reward_raw / (double)MAP_SIZE;
   if (new_paths > 0)
     reward += (double)new_paths * PATH_REWARD_WEIGHT;
   reward *= REWARD_SCALE;
@@ -2670,6 +2699,77 @@ static inline void classify_counts(u32* mem) {
 #endif /* ^WORD_SIZE_64 */
 
 
+/* Accumulate this execution's contribution to the current MAB round's
+ * rarity-weighted reward sum. No-op when no MAB algorithm is active
+ * (mab_active is checked first so non-MAB runs pay ~zero extra cost).
+ *
+ * Must run AFTER classify_counts() has already bucket-classified
+ * trace_bits in place -- trace_bits[i] here IS the bucket value already
+ * (0,1,2,4,8,16,32,64,128), do NOT re-apply count_class_lookup8.
+ *
+ * Each edge contributes 1/(1+prior_bucket) the first time it is seen
+ * in a given round: a never-before-seen edge (prior_bucket == 0)
+ * contributes the maximum (1.0), while an edge that has historically
+ * fired in the most common bucket (128) still contributes a small but
+ * strictly positive amount (1/129) instead of nothing -- this is what
+ * keeps the signal from hard-cutting to zero once the easy edges are
+ * gone. Each edge is credited at most once per round, regardless of how
+ * many executions within the round touch it.
+ *
+ * Sparse word-skip scan, same idiom as has_new_bits()/classify_counts(),
+ * so cost is proportional to the (typically small) number of nonzero
+ * bytes this exec touched, not MAP_SIZE, on the common case. */
+static inline void mab_accumulate_rarity_reward(void) {
+
+  if (!mab_active) return;
+
+#ifdef WORD_SIZE_64
+  u64* cur = (u64*)trace_bits;
+  u32  i   = MAP_SIZE >> 3;
+  u32  w   = 8;
+#else
+  u32* cur = (u32*)trace_bits;
+  u32  i   = MAP_SIZE >> 2;
+  u32  w   = 4;
+#endif
+
+  u32 base = 0;
+
+  while (i--) {
+
+    if (unlikely(*cur)) {
+
+      u8* cur8 = (u8*)cur;
+      u32 b;
+      for (b = 0; b < w; b++) {
+
+        if (cur8[b]) {
+
+          u32 idx = base + b;
+
+          if (!credited_this_round[idx]) {
+            credited_this_round[idx] = 1;
+            mab_round_edges_credited++;
+            u8 prior = edge_rarity_bucket[idx];  /* high-water mark BEFORE this exec */
+            mab_round_rarity_sum += 1.0 / (1.0 + (double)prior);
+          }
+
+          if (cur8[b] > edge_rarity_bucket[idx]) edge_rarity_bucket[idx] = cur8[b];
+
+        }
+
+      }
+
+    }
+
+    cur++;
+    base += w;
+
+  }
+
+}
+
+
 /* Get rid of shared memory (atexit handler). */
 
 static void remove_shm(void) {
@@ -3955,6 +4055,8 @@ static u8 run_target(char** argv, u32 timeout) {
   classify_counts((u32*)trace_bits);
 #endif /* ^WORD_SIZE_64 */
 
+  mab_accumulate_rarity_reward();
+
   prev_timed_out = child_timed_out;
 
   /* Report outcome to caller. */
@@ -4937,6 +5039,7 @@ static void write_mab_stats(void) {
   fprintf(f, "mab_total_rounds  : (see per-state below)\n");
   fprintf(f, "reward_scale      : %.4f\n", (double)REWARD_SCALE);
   fprintf(f, "path_reward_weight: %.8f\n", (double)PATH_REWARD_WEIGHT);
+  fprintf(f, "reward_composition: rarity_weighted\n");
   fprintf(f, "timestamp         : %llu\n\n", get_cur_time() / 1000);
   fprintf(f, "# state_id  arm_idx  pull_count  log_weight        "
              "cumul_reward      last_selected\n");
@@ -9002,7 +9105,8 @@ EXP_ST void setup_dirs_fds(void) {
     if (!mab_reward_log_f) PFATAL("Unable to create '%s'", mab_fn);
     ck_free(mab_fn);
     fprintf(mab_reward_log_f,
-            "timestamp_ms,state_id,arm_idx,edges_before,edges_after,reward\n");
+            "timestamp_ms,state_id,arm_idx,edges_before,edges_after,reward,"
+            "distinct_edges_credited,rarity_sum_raw\n");
     fflush(mab_reward_log_f);
   }
 
@@ -9923,6 +10027,14 @@ int main(int argc, char** argv) {
     mab_havoc_min     = MAB_HAVOC_MIN;
   }
 
+  /* Cached once so the per-execution rarity-accumulation hook doesn't have
+     to re-check the algorithm on every single exec. */
+  mab_active = (seed_selection_algo == EXP3 || seed_selection_algo == EXP3IX ||
+                seed_selection_algo == SLEEPING_BANDIT ||
+                seed_selection_algo == SLEEPING_BANDIT_IX ||
+                seed_selection_algo == UCB1 ||
+                seed_selection_algo == THOMPSON_SAMPLING);
+
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
   //AFLNet - Check for required arguments
@@ -10199,16 +10311,19 @@ int main(int argc, char** argv) {
       }
 
       /* Snapshot coverage/paths before fuzzing this seed (for MAB reward,
-       * computed once the whole fuzz_one() call below has completed) */
-      u32 edges_before = 0;
+       * computed once the whole fuzz_one() call below has completed).
+       * edges_before/edges_after are informational only now (global
+       * coverage context for the log) -- the reward itself is driven by
+       * the rarity-weighted sum accumulated per-execution during
+       * fuzz_one(), reset here at the start of each round. */
+      u32 edges_before = 0, edges_after = 0;
       u32 paths_before = queued_discovered;
-      if (seed_selection_algo == EXP3 ||
-          seed_selection_algo == EXP3IX ||
-          seed_selection_algo == SLEEPING_BANDIT ||
-          seed_selection_algo == SLEEPING_BANDIT_IX ||
-          seed_selection_algo == UCB1 ||
-          seed_selection_algo == THOMPSON_SAMPLING)
+      if (mab_active) {
         edges_before = count_non_255_bytes(virgin_bits);
+        memset(credited_this_round, 0, MAP_SIZE);
+        mab_round_rarity_sum = 0.0;
+        mab_round_edges_credited = 0;
+      }
 
       /* Seek to the selected seed */
       if (selected_seed) {
@@ -10233,47 +10348,42 @@ int main(int argc, char** argv) {
       skipped_fuzz = fuzz_one(use_argv);
 
       /* MAB reward update: one pull per fuzz_one() call. The arm that was
-       * drawn by choose_seed() above is scored on the net coverage/path
-       * gain accumulated over the entire fuzz_one() call (all deterministic
-       * and havoc stages combined), not on any single mutation within it.
-       * This keeps one MAB "round" aligned with one seed-selection decision,
-       * and keeps mab_reward_log's rows and mab_stats' pull_count in sync,
-       * since both are derived from the same before/after snapshot here. */
-      if (!skipped_fuzz &&
-          (seed_selection_algo == EXP3 ||
-           seed_selection_algo == EXP3IX ||
-           seed_selection_algo == SLEEPING_BANDIT ||
-           seed_selection_algo == SLEEPING_BANDIT_IX ||
-           seed_selection_algo == UCB1 ||
-           seed_selection_algo == THOMPSON_SAMPLING)) {
-        u32 edges_after = count_non_255_bytes(virgin_bits);
+       * drawn by choose_seed() above is scored on the rarity-weighted edge
+       * credit and path gain accumulated over the entire fuzz_one() call
+       * (all deterministic and havoc stages combined), not on any single
+       * mutation within it. This keeps one MAB "round" aligned with one
+       * seed-selection decision, and keeps mab_reward_log's rows and
+       * mab_stats' pull_count in sync, since both are derived from the
+       * same round-boundary accumulation here. */
+      if (!skipped_fuzz && mab_active) {
+        edges_after = count_non_255_bytes(virgin_bits); /* informational only */
         u32 paths_after = queued_discovered;
         u32 new_paths = (paths_after > paths_before)
                         ? (paths_after - paths_before) : 0;
 
         mab_update_reward(target_state_id, mab_seed_idx, seed_selection_algo,
-                          edges_before, edges_after, new_paths);
+                          mab_round_rarity_sum, new_paths);
 
         if (mab_reward_log_f) {
           /* Must stay byte-for-byte identical to the formula in
            * mab_update_reward() above (same REWARD_SCALE,
            * PATH_REWARD_WEIGHT) so the logged value always matches what
            * was actually used for the weight update. */
-          double reward_logged = 0.0;
-          if (edges_after > edges_before)
-            reward_logged = (double)(edges_after - edges_before) / (double)MAP_SIZE;
+          double reward_logged = mab_round_rarity_sum / (double)MAP_SIZE;
           if (new_paths > 0)
             reward_logged += (double)new_paths * PATH_REWARD_WEIGHT;
           reward_logged *= REWARD_SCALE;
           if (reward_logged > 1.0) reward_logged = 1.0;
           fprintf(mab_reward_log_f,
-                  "%llu,%u,%u,%u,%u,%.8f\n",
+                  "%llu,%u,%u,%u,%u,%.8f,%u,%.6f\n",
                   get_cur_time(),
                   target_state_id,
                   mab_seed_idx,
                   edges_before,
                   edges_after,
-                  reward_logged);
+                  reward_logged,
+                  mab_round_edges_credited,
+                  mab_round_rarity_sum);
           /* Flush every 100 fuzz_one() calls to bound I/O overhead */
           static u32 mab_log_flush_ctr = 0;
           if (!(++mab_log_flush_ctr % 100)) fflush(mab_reward_log_f);
