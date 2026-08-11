@@ -184,6 +184,21 @@ static u32 mab_round_edges_credited;
  * execution (run_target() is the hottest function in the fuzzer). */
 static u8  mab_active;
 
+/* Sliding window of recent rounds' raw (pre-normalization) reward scores,
+ * used to rank-normalize each new round's score into [0,1] relative to
+ * recent history instead of an assumed fixed scale. A fixed multiplicative
+ * constant (the old REWARD_SCALE approach) has to be re-calibrated every
+ * time the raw signal's magnitude shifts, and has twice caused either a
+ * hard-zero plateau or a hard-1.0 saturation in this codebase. Percentile
+ * rank against recent history is self-calibrating and immune to both
+ * failure modes by construction: whatever the raw magnitude is this
+ * round, the reward reflects how it compares to *recent* rounds, not an
+ * assumed absolute scale. */
+#define MAB_REWARD_WINDOW 40
+static double mab_reward_window[MAB_REWARD_WINDOW];
+static u32    mab_reward_window_count = 0; /* valid entries so far, caps at MAB_REWARD_WINDOW */
+static u32    mab_reward_window_pos   = 0; /* next ring-buffer write slot */
+
 static s32 shm_id;                    /* ID of the SHM region             */
 
 static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
@@ -430,20 +445,15 @@ static u32 mab_havoc_cycles   = HAVOC_CYCLES;
 static u32 mab_splice_cycles  = SPLICE_CYCLES;
 static u32 mab_havoc_min      = HAVOC_MIN;
 
-/* Overall reward magnitude scale. The raw reward (edge-novelty term plus
- * path bonus, see mab_update_reward() below) is on the order of 1e-5 to
- * 1e-4 per round, far below the [0,1] range that EXP3/UCB1/Thompson
- * Sampling's update rules assume they are operating in. This constant
- * multiplies the combined reward (after summing the edge and path terms,
- * before clamping to 1.0) so a typical productive round lands well inside
- * (0,1] instead of near 0, giving the MAB algorithms a usable magnitude of
- * signal without changing what is being measured -- only its scale. */
-#define REWARD_SCALE 100.0
-
 /* Reward bonus per new path found while fuzzing a seed. Chosen so a single
  * new path is worth roughly the same as a handful of new edges, keeping
  * the path-discovery signal comparable in size to the edge-novelty term
- * before REWARD_SCALE is applied to their sum. */
+ * that it's summed with to form raw_score in mab_update_reward() below.
+ * Its absolute magnitude no longer needs to hit a particular target value
+ * (unlike the old REWARD_SCALE-based design, now removed): the final
+ * reward is a sliding-window percentile rank of raw_score (see
+ * mab_percentile_rank_and_insert()), so only raw_score's *relative*
+ * ordering across rounds matters, not its absolute size. */
 #define PATH_REWARD_WEIGHT 0.0001
 u8 feedback_type = CODE_FEEDBACK;   /* Select interesting seeds based on code feedback */
 u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machine */
@@ -812,13 +822,67 @@ static void mab_ensure_arms(state_info_t *state) {
   }
 }
 
+/* Rank this round's raw (pre-normalization) reward score against the
+ * sliding window of recent rounds' raw scores, then insert it into the
+ * window for future rounds to be ranked against. Returns a value in
+ * [0,1]: 1.0 means this round's raw score was >= every recent round's
+ * raw score, 0.0 means it was < every recent round's raw score. Ties
+ * count as "<=", so a run of identical raw scores all get the same
+ * (high) rank rather than being arbitrarily ordered.
+ *
+ * Ranking happens BEFORE insertion, so a round is never compared against
+ * itself. The very first round of a process (empty window) always gets
+ * 1.0, since there's nothing to compare against yet -- a harmless,
+ * one-time bootstrap value.
+ *
+ * This replaces a fixed multiplicative scale constant (REWARD_SCALE) as
+ * the final "raw score -> [0,1]" step. A fixed constant has to be
+ * re-calibrated every time the raw signal's magnitude shifts, and shifting
+ * exactly that has already caused both a hard-zero plateau (most rounds
+ * scoring 0) and a hard-one saturation (100% of rounds scoring 1.0) in
+ * this codebase. Percentile rank against recent history is self-
+ * calibrating and immune to both failure modes by construction: whatever
+ * the raw magnitude is this round, the reward reflects how it compares to
+ * *recent* rounds, not an assumed absolute scale.
+ *
+ * O(MAB_REWARD_WINDOW) per call via a linear scan. Called once per MAB
+ * round (not once per execution), so this is negligible overhead; no need
+ * for a sorted structure or binary search at this window size. */
+static double mab_percentile_rank_and_insert(double raw_score) {
+
+  u32 n = mab_reward_window_count;
+  double reward;
+
+  if (n == 0) {
+    reward = 1.0;
+  } else {
+    u32 less_or_equal = 0;
+    for (u32 i = 0; i < n; i++)
+      if (mab_reward_window[i] <= raw_score) less_or_equal++;
+    reward = (double)less_or_equal / (double)n;
+  }
+
+  mab_reward_window[mab_reward_window_pos] = raw_score;
+  mab_reward_window_pos = (mab_reward_window_pos + 1) % MAB_REWARD_WINDOW;
+  if (mab_reward_window_count < MAB_REWARD_WINDOW) mab_reward_window_count++;
+
+  return reward;
+}
+
 /* -------------------------------------------------------------------------
  * MAB reward update.  Called from the main fuzzing loop immediately after
- * fuzz_one() returns, when a MAB algorithm is active.
+ * fuzz_one() returns, when a MAB algorithm is active. Returns the reward
+ * actually used for the weight update, so the caller can log the exact
+ * value without recomputing the formula a second time (see
+ * mab_percentile_rank_and_insert()'s side effect below for why a second,
+ * independent computation would silently corrupt the sliding window).
  *
- * reward = REWARD_SCALE * [(rarity-weighted edge credit accumulated during
- *          this fuzz_one call) / MAP_SIZE, plus a per-new-path bonus],
- *          clamped to [0, 1].
+ * raw_score = (rarity-weighted edge credit accumulated during this
+ *              fuzz_one call) / MAP_SIZE, plus a per-new-path bonus.
+ * reward    = this round's raw_score, rank-normalized against a sliding
+ *             window of recent rounds' raw_score values (see
+ *             mab_percentile_rank_and_insert()) -- always in [0,1] by
+ *             construction, no fixed scale constant involved.
  *
  * The edge term is no longer derived from virgin_bits (a monotonically
  * shrinking global bitmap that permanently stops crediting an edge once
@@ -832,28 +896,38 @@ static void mab_ensure_arms(state_info_t *state) {
  * This keeps the reward signal from hard-cutting to zero once the easy
  * edges have already been found by someone. Note this is still a global
  * (not per-state) signal, same limitation virgin_bits had.
- * ------------------------------------------------------------------------- */
-void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
-                       double rarity_reward_raw, u32 new_paths) {
+ *
+ * raw_score_out: if non-NULL, the pre-percentile-rank raw_score value is
+ * written here for the caller's CSV logging, so there is exactly one
+ * computation site for raw_score too (not just for reward) -- avoiding
+ * the same "two formulas that must be kept manually in sync forever"
+ * fragility this redesign eliminated for the reward computation itself. */
+double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
+                         double rarity_reward_raw, u32 new_paths,
+                         double *raw_score_out) {
   khint_t k = kh_get(hms, khms_states, target_state_id);
-  if (k == kh_end(khms_states)) return;
+  if (k == kh_end(khms_states)) return 0.0;
   state_info_t *state = kh_val(khms_states, k);
 
   mab_ensure_arms(state);
-  if (!state->mab_arms || seed_index >= state->mab_arms_count) return;
+  if (!state->mab_arms || seed_index >= state->mab_arms_count) return 0.0;
 
   mab_arm_t *arm = &state->mab_arms[seed_index];
 
-  /* reward in [0,1]: rarity-weighted edge credit for this round, plus a
-   * fixed bonus per new path discovered (path-discovery signal), summed
-   * and then scaled up to a magnitude usable by the MAB update rules. The
-   * path bonus keeps the MAB learning after the global edge frontier is
-   * exhausted -- paths continue growing even when no new edges are found. */
-  double reward = rarity_reward_raw / (double)MAP_SIZE;
+  /* raw_score: rarity-weighted edge credit for this round, plus a fixed
+   * bonus per new path discovered (path-discovery signal). The path bonus
+   * keeps the MAB learning after the global edge frontier is exhausted --
+   * paths continue growing even when no new edges are found. Unlike the
+   * old REWARD_SCALE-based formula, this value's absolute magnitude no
+   * longer matters -- only how it ranks against recent rounds (see
+   * mab_percentile_rank_and_insert()) -- so PATH_REWARD_WEIGHT only needs
+   * to make a new path noticeable relative to a typical round's rarity
+   * term, not hit any particular absolute target value. */
+  double raw_score = rarity_reward_raw / (double)MAP_SIZE;
   if (new_paths > 0)
-    reward += (double)new_paths * PATH_REWARD_WEIGHT;
-  reward *= REWARD_SCALE;
-  if (reward > 1.0) reward = 1.0;
+    raw_score += (double)new_paths * PATH_REWARD_WEIGHT;
+  if (raw_score_out) *raw_score_out = raw_score;
+  double reward = mab_percentile_rank_and_insert(raw_score);
 
   u32 K = state->seeds_count;
   u64 t = state->mab_round; /* round index before this pull (>=1 after first pull) */
@@ -1019,6 +1093,8 @@ void mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
   arm->cumul_reward += reward;
   arm->last_selected = state->mab_round;
   state->mab_round++;
+
+  return reward;
 }
 
 /* Select a seed to exercise the target state */
@@ -5037,9 +5113,9 @@ static void write_mab_stats(void) {
   fprintf(f, "mab_K_active_s0   : %u\n", _k_active_s0);
   fprintf(f, "mab_sleep_design  : exhaustion_signal\n");
   fprintf(f, "mab_total_rounds  : (see per-state below)\n");
-  fprintf(f, "reward_scale      : %.4f\n", (double)REWARD_SCALE);
   fprintf(f, "path_reward_weight: %.8f\n", (double)PATH_REWARD_WEIGHT);
-  fprintf(f, "reward_composition: rarity_weighted\n");
+  fprintf(f, "reward_window_size: %u\n", (unsigned)MAB_REWARD_WINDOW);
+  fprintf(f, "reward_composition: rarity_weighted_percentile_rank\n");
   fprintf(f, "timestamp         : %llu\n\n", get_cur_time() / 1000);
   fprintf(f, "# state_id  arm_idx  pull_count  log_weight        "
              "cumul_reward      last_selected\n");
@@ -9106,7 +9182,7 @@ EXP_ST void setup_dirs_fds(void) {
     ck_free(mab_fn);
     fprintf(mab_reward_log_f,
             "timestamp_ms,state_id,arm_idx,edges_before,edges_after,reward,"
-            "distinct_edges_credited,rarity_sum_raw\n");
+            "distinct_edges_credited,rarity_sum_raw,raw_score\n");
     fflush(mab_reward_log_f);
   }
 
@@ -10354,28 +10430,31 @@ int main(int argc, char** argv) {
        * mutation within it. This keeps one MAB "round" aligned with one
        * seed-selection decision, and keeps mab_reward_log's rows and
        * mab_stats' pull_count in sync, since both are derived from the
-       * same round-boundary accumulation here. */
+       * same round-boundary accumulation here.
+       *
+       * mab_update_reward() is the single source of truth for both
+       * raw_score and reward, and hands both back to the caller (reward
+       * via its return value, raw_score via the out-parameter) instead of
+       * the CSV-logging code recomputing either formula a second time.
+       * This is not just a deduplication convenience: the percentile-rank
+       * step has a side effect (inserting raw_score into the sliding
+       * window), so a second independent computation of raw_score for
+       * logging purposes would insert the same value into the window
+       * twice, silently corrupting its statistics. */
       if (!skipped_fuzz && mab_active) {
         edges_after = count_non_255_bytes(virgin_bits); /* informational only */
         u32 paths_after = queued_discovered;
         u32 new_paths = (paths_after > paths_before)
                         ? (paths_after - paths_before) : 0;
 
-        mab_update_reward(target_state_id, mab_seed_idx, seed_selection_algo,
-                          mab_round_rarity_sum, new_paths);
+        double raw_score = 0.0;
+        double reward_logged = mab_update_reward(target_state_id, mab_seed_idx,
+                                seed_selection_algo, mab_round_rarity_sum,
+                                new_paths, &raw_score);
 
         if (mab_reward_log_f) {
-          /* Must stay byte-for-byte identical to the formula in
-           * mab_update_reward() above (same REWARD_SCALE,
-           * PATH_REWARD_WEIGHT) so the logged value always matches what
-           * was actually used for the weight update. */
-          double reward_logged = mab_round_rarity_sum / (double)MAP_SIZE;
-          if (new_paths > 0)
-            reward_logged += (double)new_paths * PATH_REWARD_WEIGHT;
-          reward_logged *= REWARD_SCALE;
-          if (reward_logged > 1.0) reward_logged = 1.0;
           fprintf(mab_reward_log_f,
-                  "%llu,%u,%u,%u,%u,%.8f,%u,%.6f\n",
+                  "%llu,%u,%u,%u,%u,%.8f,%u,%.6f,%.8f\n",
                   get_cur_time(),
                   target_state_id,
                   mab_seed_idx,
@@ -10383,7 +10462,8 @@ int main(int argc, char** argv) {
                   edges_after,
                   reward_logged,
                   mab_round_edges_credited,
-                  mab_round_rarity_sum);
+                  mab_round_rarity_sum,
+                  raw_score);
           /* Flush every 100 fuzz_one() calls to bound I/O overhead */
           static u32 mab_log_flush_ctr = 0;
           if (!(++mab_log_flush_ctr % 100)) fflush(mab_reward_log_f);
