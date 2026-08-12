@@ -10462,8 +10462,12 @@ int main(int argc, char** argv) {
                                 new_paths, &raw_score);
 
         if (mab_reward_log_f) {
+          /* reward and raw_score use %.17g for exact double round-trip
+           * precision, since both feed the sliding-window percentile-rank
+           * computation and a lower precision can make two distinct
+           * values collide into the same logged string. */
           fprintf(mab_reward_log_f,
-                  "%llu,%u,%u,%u,%u,%.8f,%u,%.6f,%.8f\n",
+                  "%llu,%u,%u,%u,%u,%.17g,%u,%.6f,%.17g\n",
                   get_cur_time(),
                   target_state_id,
                   mab_seed_idx,
