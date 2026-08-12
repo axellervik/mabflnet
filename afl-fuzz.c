@@ -975,13 +975,18 @@ double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
     }
 
     case EXP3IX: {
-      /* EXP3-IX (implicit exploration):
-       * eta  = sqrt(ln(K) / (K * t))
-       * p_i  = exp(w_i) / sum_exp_w           (no explicit mixing)
-       * update: w_i += eta * reward / p_i
-       * The IX bonus (eta/p_i) is absorbed into the learning rate.
+      /* EXP3-IX (implicit exploration): eta = sqrt(ln(K)/(K*t)), draw is a
+       * pure softmax p_i = exp(w_i)/sum_exp_w (no uniform mixing). The
+       * implicit-exploration term gamma_ix is added to the probability in
+       * the update only, per Kocak et al. 2014 / Neu 2015:
+       *   w_i += eta * reward / (p_i + gamma_ix)
+       * gamma_ix = eta/2 bounds every update to at most 2*reward <= 2
+       * regardless of how small p_i is (e.g. on an arm's first pull, where
+       * p_i = 1/K), which is the whole point of the IX term -- without it,
+       * dividing by p_i alone is unbounded as p_i -> 0.
        */
       double eta = sqrt(log((double)(K + 1)) / ((double)K * (double)t));
+      double gamma_ix = eta / 2.0;
 
       double sum_exp_w = 0.0;
       for (u32 i = 0; i < K; i++)
@@ -991,7 +996,7 @@ double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
       p_i = exp_wi / sum_exp_w;
       if (p_i < 1e-12) p_i = 1e-12;
 
-      arm->log_weight += eta * reward / p_i;
+      arm->log_weight += eta * reward / (p_i + gamma_ix);
 
       /* Normalise */
       if (arm->log_weight > 500.0) {
@@ -1043,9 +1048,12 @@ double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
       break;
 
     case SLEEPING_BANDIT_IX: {
-      /* Sleeping Bandit with EXP3-IX weight update.
-       * Same active-arm gating as SLEEPING_BANDIT, but uses the IX implicit
-       * exploration update: w_i += eta * reward / p_i (no uniform mixing).
+      /* Sleeping Bandit with EXP3-IX weight update: same active-arm gating
+       * as SLEEPING_BANDIT, but the IX update from the EXP3IX case above,
+       * restricted to the awake set (K_active in place of K). The IX term
+       * gamma_ix = eta/2 is added to p_i in the update only, bounding every
+       * update to at most 2*reward regardless of how small p_i is -- see
+       * the EXP3IX case for the derivation.
        * K_active is stored in upper 32 bits of total_reward_bits by choose_seed(). */
       u32 K_active = (u32)(arm->total_reward_bits >> 32);
       if (K_active == 0) K_active = K;
@@ -1053,6 +1061,7 @@ double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
 
       double eta = sqrt(log((double)(K_active + 1)) /
                         ((double)K_active * (double)t));
+      double gamma_ix = eta / 2.0;
 
       double sum_exp_w = 0.0;
       for (u32 i = 0; i < K; i++)
@@ -1062,7 +1071,7 @@ double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
       p_i = exp_wi / sum_exp_w;
       if (p_i < 1e-12) p_i = 1e-12;
 
-      arm->log_weight += eta * reward / p_i;
+      arm->log_weight += eta * reward / (p_i + gamma_ix);
 
       if (arm->log_weight > 500.0) {
         double max_lw = arm->log_weight;
