@@ -187,9 +187,8 @@ static u8  mab_active;
 /* Sliding window of recent rounds' raw (pre-normalization) reward scores,
  * used to rank-normalize each new round's score into [0,1] relative to
  * recent history instead of an assumed fixed scale. A fixed multiplicative
- * constant (the old REWARD_SCALE approach) has to be re-calibrated every
- * time the raw signal's magnitude shifts, and has twice caused either a
- * hard-zero plateau or a hard-1.0 saturation in this codebase. Percentile
+ * constant would need re-calibration whenever the raw signal's magnitude
+ * shifts, risking a hard-zero plateau or a hard-1.0 saturation. Percentile
  * rank against recent history is self-calibrating and immune to both
  * failure modes by construction: whatever the raw magnitude is this
  * round, the reward reflects how it compares to *recent* rounds, not an
@@ -753,7 +752,7 @@ unsigned int choose_target_state(u8 mode) {
  * beta_sample(alpha, beta): standard Beta via two gamma draws.
  * ------------------------------------------------------------------------- */
 static double gamma_sample(double shape) {
-  /* Marsaglia & Tsang (2000) method. shape must be >= 1. */
+  /* Marsaglia-Tsang squeeze method. shape must be >= 1. */
   double d, c, x, v, u;
   d = shape - 1.0 / 3.0;
   c = 1.0 / sqrt(9.0 * d);
@@ -802,6 +801,19 @@ static void mab_warm_start_arms(state_info_t *state, u32 from, u32 to) {
   }
 }
 
+/* Sleeping-bandit awake/asleep predicate (SLEEPING_BANDIT / SLEEPING_BANDIT_IX
+ * only): a seed is asleep once fuzzed and non-favored, past the first queue
+ * cycle. Initial seeds are handled separately: cull_queue() only clears
+ * favored for non-initial seeds, so an initial seed's favored bit can go
+ * 0->1 but never back to 0 -- gating on !favored would keep it permanently
+ * awake once favored even once. was_fuzzed && queue_cycle > 1 alone is used
+ * for initial seeds instead. */
+static inline u8 mab_seed_asleep(struct queue_entry *q) {
+  if (queue_cycle <= 1 || !q->was_fuzzed) return 0;
+  if (q->is_initial_seed) return 1;
+  return !q->favored;
+}
+
 static void mab_ensure_arms(state_info_t *state) {
   if (state->mab_arms == NULL && state->seeds_count > 0) {
     state->mab_arms = (mab_arm_t *)ck_alloc(state->seeds_count * sizeof(mab_arm_t));
@@ -837,13 +849,12 @@ static void mab_ensure_arms(state_info_t *state) {
  *
  * This replaces a fixed multiplicative scale constant (REWARD_SCALE) as
  * the final "raw score -> [0,1]" step. A fixed constant has to be
- * re-calibrated every time the raw signal's magnitude shifts, and shifting
- * exactly that has already caused both a hard-zero plateau (most rounds
- * scoring 0) and a hard-one saturation (100% of rounds scoring 1.0) in
- * this codebase. Percentile rank against recent history is self-
- * calibrating and immune to both failure modes by construction: whatever
- * the raw magnitude is this round, the reward reflects how it compares to
- * *recent* rounds, not an assumed absolute scale.
+ * re-calibrated whenever the raw signal's magnitude shifts, risking a
+ * hard-zero plateau (most rounds scoring 0) or a hard-one saturation
+ * (most rounds scoring 1.0). Percentile rank against recent history is
+ * self-calibrating and immune to both failure modes by construction:
+ * whatever the raw magnitude is this round, the reward reflects how it
+ * compares to *recent* rounds, not an assumed absolute scale.
  *
  * O(MAB_REWARD_WINDOW) per call via a linear scan. Called once per MAB
  * round (not once per execution), so this is negligible overhead; no need
@@ -899,9 +910,8 @@ static double mab_percentile_rank_and_insert(double raw_score) {
  *
  * raw_score_out: if non-NULL, the pre-percentile-rank raw_score value is
  * written here for the caller's CSV logging, so there is exactly one
- * computation site for raw_score too (not just for reward) -- avoiding
- * the same "two formulas that must be kept manually in sync forever"
- * fragility this redesign eliminated for the reward computation itself. */
+ * computation site for raw_score as well as for reward -- no duplicate
+ * formula to keep in sync. */
 double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
                          double rarity_reward_raw, u32 new_paths,
                          double *raw_score_out) {
@@ -978,7 +988,7 @@ double mab_update_reward(u32 target_state_id, u32 seed_index, u8 mode,
       /* EXP3-IX (implicit exploration): eta = sqrt(ln(K)/(K*t)), draw is a
        * pure softmax p_i = exp(w_i)/sum_exp_w (no uniform mixing). The
        * implicit-exploration term gamma_ix is added to the probability in
-       * the update only, per Kocak et al. 2014 / Neu 2015:
+       * the update only:
        *   w_i += eta * reward / (p_i + gamma_ix)
        * gamma_ix = eta/2 bounds every update to at most 2*reward <= 2
        * regardless of how small p_i is (e.g. on an arm's first pull, where
@@ -1237,24 +1247,11 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
       }
 
       case SLEEPING_BANDIT: {
-        /* Sleeping Bandit (EXP3-S variant).
-         *
-         * "Asleep" is defined using AFLNet's own exhaustion bookkeeping: a
-         * seed goes to sleep once AFLNet's global bitmap-competition
-         * (cull_queue()/update_bitmap_score()) has already marked it
-         * fuzzed-and-non-favored, and at least one full queue cycle has
-         * elapsed since the run started. This is an exogenous signal
-         * (computed independently of the MAB's own draw history), matching
-         * the sleeping-bandit literature (Kleinberg 2010, Saha 2020, Nguyen
-         * 2024) and avoids a "never pulled == always awake" dilution trap: a
-         * brand-new seed has was_fuzzed==0, so it is always awake by
-         * construction until AFLNet itself decides it is redundant.
-         *
-         * We run EXP3 restricted to the awake set. If no arms are awake, all arms
-         * are treated as awake (full reset) — same fallback as before.
-         *
-         * K_active is stored temporarily in the upper 32 bits of
-         * arm->total_reward_bits so mab_update_reward() can retrieve it.
+        /* Sleeping Bandit (EXP3-S variant): EXP3 restricted to the awake
+         * set (see mab_seed_asleep()). If no arms are awake, all arms are
+         * treated as awake (full reset). K_active is stored temporarily
+         * in the upper 32 bits of arm->total_reward_bits so
+         * mab_update_reward() can retrieve it.
          */
         mab_ensure_arms(state);
 
@@ -1265,7 +1262,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         u32 K_active = 0;
         for (u32 i = 0; i < K; i++) {
           struct queue_entry *seed_i = state->seeds[i];
-          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 asleep = mab_seed_asleep(seed_i);
           if (!asleep) K_active++;
         }
         if (K_active == 0) K_active = K; /* all asleep → wake all */
@@ -1279,7 +1276,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         double sum_exp_w = 0.0;
         for (u32 i = 0; i < K; i++) {
           struct queue_entry *seed_i = state->seeds[i];
-          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 asleep = mab_seed_asleep(seed_i);
           if (!asleep || K_active == K)
             sum_exp_w += exp(state->mab_arms[i].log_weight);
         }
@@ -1289,7 +1286,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         u32 chosen = K - 1; /* fallback */
         for (u32 i = 0; i < K; i++) {
           struct queue_entry *seed_i = state->seeds[i];
-          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 asleep = mab_seed_asleep(seed_i);
           u8 awake = !asleep || (K_active == K);
           if (!awake) continue;
           double p_i = (1.0 - gamma) * (exp(state->mab_arms[i].log_weight) / sum_exp_w)
@@ -1323,7 +1320,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         u32 K_active = 0;
         for (u32 i = 0; i < K; i++) {
           struct queue_entry *seed_i = state->seeds[i];
-          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 asleep = mab_seed_asleep(seed_i);
           if (!asleep) K_active++;
         }
         if (K_active == 0) K_active = K;
@@ -1333,7 +1330,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         double sum_exp_w = 0.0;
         for (u32 i = 0; i < K; i++) {
           struct queue_entry *seed_i = state->seeds[i];
-          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 asleep = mab_seed_asleep(seed_i);
           if (!asleep || K_active == K)
             sum_exp_w += exp(state->mab_arms[i].log_weight);
         }
@@ -1344,7 +1341,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         u32 chosen = K - 1;
         for (u32 i = 0; i < K; i++) {
           struct queue_entry *seed_i = state->seeds[i];
-          u8 asleep = seed_i->was_fuzzed && !seed_i->favored && queue_cycle > 1;
+          u8 asleep = mab_seed_asleep(seed_i);
           u8 awake = !asleep || (K_active == K);
           if (!awake) continue;
           double p_i = exp(state->mab_arms[i].log_weight) / sum_exp_w;
