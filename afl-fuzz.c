@@ -834,6 +834,65 @@ static void mab_ensure_arms(state_info_t *state) {
   }
 }
 
+/* Evict the lowest-performing arm from `state` if its seed pool exceeds
+ * MAX_SEEDS_PER_STATE. No-op for non-MAB algorithms. Uses swap-with-last
+ * to keep seeds[]/mab_arms[] dense, then re-logs the moved arm's new
+ * index. Excludes the arm currently in flight this round (the one
+ * mab_update_reward() will score after fuzz_one() returns) so an
+ * eviction can't misattribute its reward. */
+static void mab_cap_seeds(state_info_t *state) {
+  if (seed_selection_algo != EXP3 && seed_selection_algo != EXP3IX &&
+      seed_selection_algo != SLEEPING_BANDIT &&
+      seed_selection_algo != SLEEPING_BANDIT_IX &&
+      seed_selection_algo != UCB1 && seed_selection_algo != THOMPSON_SAMPLING)
+    return;
+
+  if (state->seeds_count <= MAX_SEEDS_PER_STATE) return;
+
+  u32 protected_idx = (state->id == target_state_id)
+                       ? state->selected_seed_index
+                       : (u32)-1;
+
+  u32 last = state->seeds_count - 1;
+
+  /* Victim: lowest cumul_reward/pull_count among pulled arms, excluding
+   * the protected and just-added slots. Fall back to index 0 (or 1 if
+   * 0 is protected) if nothing has been pulled yet. */
+  u32 victim = (u32)-1;
+  double worst_reward = 0.0;
+  for (u32 i = 0; i < last; i++) {
+    if (i == protected_idx) continue;
+    if (state->mab_arms && state->mab_arms[i].pull_count > 0) {
+      double avg = state->mab_arms[i].cumul_reward /
+                   (double)state->mab_arms[i].pull_count;
+      if (victim == (u32)-1 || avg < worst_reward) {
+        victim = i;
+        worst_reward = avg;
+      }
+    }
+  }
+  if (victim == (u32)-1) victim = (protected_idx == 0) ? 1 : 0;
+
+  state->seeds[victim] = state->seeds[last];
+  state->seeds_count--;
+
+  if (state->mab_arms) {
+    state->mab_arms[victim] = state->mab_arms[last];
+    state->mab_arms_count--;
+  }
+
+  /* Keep selected_seed_index valid if it pointed at the moved slot */
+  if (state->selected_seed_index == last)
+    state->selected_seed_index = victim;
+
+  if (mab_seed_map_f) {
+    struct queue_entry *moved = (struct queue_entry *)state->seeds[victim];
+    fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
+            state->id, victim, moved->index,
+            moved->generating_state_id, (u32)moved->is_initial_seed);
+  }
+}
+
 /* Rank this round's raw (pre-normalization) reward score against the
  * sliding window of recent rounds' raw scores, then insert it into the
  * window for future rounds to be ranked against. Returns a value in
@@ -1588,12 +1647,16 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
        state->mab_arms_count = state->seeds_count;
      }
 
+     /* Enforce seed cap before computing arm_index below */
+     mab_cap_seeds(state);
+
      u32 arm_index = state->seeds_count - 1;
 
      if (mab_seed_map_f)
        fprintf(mab_seed_map_f, "%u,%u,%u,%u,%u\n",
                state->id, arm_index, q->index,
                q->generating_state_id, (u32)q->is_initial_seed);
+
 
     was_fuzzed_map[0][q->index] = 0; //Mark it as reachable but not fuzzed
   } else {
@@ -1627,6 +1690,9 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
                   (state->seeds_count - old_count) * sizeof(mab_arm_t));
            state->mab_arms_count = state->seeds_count;
          }
+
+         /* Enforce seed cap before computing arm_index below */
+         mab_cap_seeds(state);
 
          u32 arm_index = state->seeds_count - 1;
 
@@ -1665,6 +1731,9 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
            memset(newState->mab_arms, 0, newState->seeds_count * sizeof(mab_arm_t));
            newState->mab_arms_count = newState->seeds_count;
          }
+
+         /* No-op here (new state starts with 1 seed); kept for consistency */
+         mab_cap_seeds(newState);
 
          u32 arm_index = newState->seeds_count - 1;
 

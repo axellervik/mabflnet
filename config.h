@@ -146,6 +146,12 @@
 #define MAB_SPLICE_CYCLES    2
 #define MAB_HAVOC_MIN        4
 
+/* Max seeds (arms) kept per state for MAB algorithms. Excess seeds are
+   evicted (lowest performing first) to bound K. Not applied to
+   RANDOM_SELECTION/ROUND_ROBIN/FAVOR. */
+
+#define MAX_SEEDS_PER_STATE  30
+
 /* Maximum offset for integer addition / subtraction stages: */
 
 #define ARITH_MAX           35
